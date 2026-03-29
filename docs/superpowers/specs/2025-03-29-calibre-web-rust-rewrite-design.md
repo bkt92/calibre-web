@@ -193,56 +193,396 @@ calibre-web-rust/
 
 ## Database Design
 
-### Schema Overview
+### Architecture Decision: Two-Database Strategy
 
-The database schema is **Calibre-compatible** for easy importing while optimized for Rust/PostgreSQL.
+**CRITICAL DECISION:** This system uses **TWO databases** to maintain compatibility with Calibre desktop while optimizing performance.
 
-**Core Calibre Tables (Mirrored):**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Calibre-Web Application                 │
+│                                                              │
+│  ┌──────────────────────┐        ┌──────────────────────┐ │
+│  │  PostgreSQL          │        │  Calibre SQLite       │ │
+│  │  (Application DB)     │        │  (metadata.db)        │ │
+│  │                      │        │                       │ │
+│  │  - users             │        │  - books              │ │
+│  │  - sessions          │        │  - authors            │ │
+│  │  - shelves           │        │  - series             │ │
+│  │  - tasks             │        │  - tags                │ │
+│  │  - config            │        │  - custom_columns      │ │
+│  │  - permissions       │        │  - data (formats)      │ │
+│  └──────────────────────┘        └──────────────────────┘ │
+│         ↓↑                                    ↓↑           │
+│    Read/Write                            Read-Only        │
+│    (SQLx)                               (rusqlite)       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Why Two Databases?**
+
+1. **Calibre Desktop Compatibility** - Users can continue using Calibre desktop to manage their library
+2. **No Migration Friction** - Books added via Calibre desktop immediately available
+3. **Performance** - PostgreSQL for application state (concurrent writes, complex queries)
+4. **Simplicity** - Read-only access to Calibre data eliminates sync complexity
+
+**Database Technologies:**
+- **Application DB:** PostgreSQL 15+ (via SQLx)
+- **Calibre DB:** SQLite (via rusqlite, read-only)
+
+---
+
+### Application Database Schema (PostgreSQL)
+
+**Application Tables:**
+
+```sql
+-- User management
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(100) UNIQUE NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,  -- argon2
+    role_bitmask BIGINT NOT NULL DEFAULT 0,
+    locale VARCHAR(10) DEFAULT 'en',
+    kindle_email VARCHAR(255),
+    sidebar_settings BIGINT DEFAULT 0,
+    denied_tags TEXT[],  -- Array of tag names for content filtering
+    allowed_tags TEXT[],
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_login TIMESTAMP
+);
+
+CREATE TABLE user_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_token TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_sessions_token ON user_sessions(session_token);
+CREATE INDEX idx_user_sessions_expires ON user_sessions(expires_at);
+
+-- Shelves (custom collections)
+CREATE TABLE shelves (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    is_public BOOLEAN DEFAULT FALSE,
+    kobo_sync BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, name)
+);
+
+CREATE TABLE shelf_books (
+    shelf_id INTEGER NOT NULL REFERENCES shelves(id) ON DELETE CASCADE,
+    book_id INTEGER NOT NULL,  -- References Calibre book ID
+    added_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    order_index INTEGER DEFAULT 0,
+    PRIMARY KEY (shelf_id, book_id)
+);
+
+-- Downloads tracking
+CREATE TABLE downloads (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    book_id INTEGER NOT NULL,  -- References Calibre book ID
+    format TEXT,
+    downloaded_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_downloads_user ON downloads(user_id, downloaded_at DESC);
+
+-- Background tasks
+CREATE TABLE tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_type TEXT NOT NULL,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    status TEXT NOT NULL,  -- pending, running, completed, failed, cancelled
+    progress INTEGER DEFAULT 0,
+    result JSONB,
+    error_message TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMP,
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3
+);
+
+CREATE INDEX idx_tasks_user ON tasks(user_id, created_at DESC);
+CREATE INDEX idx_tasks_status ON tasks(status, created_at);
+
+-- Configuration (key-value store)
+CREATE TABLE config (
+    key VARCHAR(100) PRIMARY KEY,
+    value JSONB NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Metadata cache
+CREATE TABLE metadata_cache (
+    id SERIAL PRIMARY KEY,
+    provider TEXT NOT NULL,
+    query TEXT NOT NULL,
+    result JSONB NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX idx_metadata_cache_lookup ON metadata_cache(provider, query, expires_at);
+
+-- Kobo sync state
+CREATE TABLE kobo_synced_books (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    book_id INTEGER NOT NULL,  -- References Calibre book ID
+    last_synced TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, book_id)
+);
+
+CREATE TABLE kobo_reading_state (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    book_id INTEGER NOT NULL,  -- References Calibre book ID
+    current_bookmark TEXT,
+    finished BOOLEAN DEFAULT FALSE,
+    priority TIMESTAMP DEFAULT NOW(),
+    UNIQUE(user_id, book_id)
+);
+
+-- Calibre library import tracking
+CREATE TABLE calibre_imports (
+    id SERIAL PRIMARY KEY,
+    library_path TEXT NOT NULL UNIQUE,
+    last_import_at TIMESTAMP,
+    last_book_count INTEGER,
+    imported_book_ids INTEGER[],
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+---
+
+### Calibre Database Access (SQLite - Read-Only)
+
+**Calibre Schema (Accessed via rusqlite):**
+
+The application reads directly from Calibre's `metadata.db`:
 
 - `books` - Main book records
 - `authors` - Author information
 - `series` - Series information
 - `tags` - Tags/categories
-- `ratings` - Rating levels (0-10 scale)
+- `ratings` - Rating levels
 - `languages` - Language codes
 - `publishers` - Publisher information
 - `identifiers` - ISBN, UUID, ASIN, Goodreads, etc.
 - `comments` - Book descriptions
 - `data` - eBook formats
-- `custom_columns` - Dynamic Calibre custom columns
-- `books_*_link` - Association tables (many-to-many)
+- `custom_column_*` - Dynamic custom columns
+- `books_*_link` - Association tables
 
-**Application Tables (New):**
+**Connection Management:**
 
-- `users` - User accounts with role bitmasks
-- `user_sessions` - Session management
-- `shelves` - Custom book collections
-- `shelf_books` - Books on shelves
-- `downloads` - Download history
-- `tasks` - Background task tracking
-- `config` - Key-value configuration
-- `metadata_cache` - Metadata provider cache
-- `kobo_synced_books` - Kobo sync state
-- `kobo_reading_state` - Kobo reading progress
+```rust
+// src/infrastructure/database/calibre.rs
+
+use rusqlite::Connection;
+use std::path::PathBuf;
+
+pub struct CalibreDB {
+    pool: r2d2::Pool<rusqlite::Connection>,
+}
+
+impl CalibreDB {
+    pub fn new(db_path: PathBuf) -> Result<Self, CalibreError> {
+        let pool = r2d2::Pool::builder()
+            .max_size(5)  // Read-only needs fewer connections
+            .build(rusqlite::SqliteConnection::open(db_path))?;
+
+        Ok(Self { pool })
+    }
+
+    pub async fn get_book(&self, id: i32) -> Result<CalibreBook, CalibreError> {
+        let conn = self.pool.get()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, title, sort, author_sort, timestamp, pubdate,
+                    series_index, last_modified, path, has_cover, uuid
+             FROM books WHERE id = ?"
+        )?;
+
+        stmt.query_row(id, |row| {
+            Ok(CalibreBook {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                sort: row.get(2)?,
+                author_sort: row.get(3)?,
+                timestamp: row.get(4)?,
+                pubdate: row.get(5)?,
+                series_index: row.get(6)?,
+                last_modified: row.get(7)?,
+                path: row.get(8)?,
+                has_cover: row.get(9)?,
+                uuid: row.get(10)?,
+            })
+        })
+    }
+}
+```
+
+---
+
+### Custom Columns Architecture
+
+**Challenge:** Calibre custom columns are dynamic user-defined fields. This system must import and support them.
+
+**Storage Strategy: JSONB + Metadata**
+
+```sql
+-- Custom column definitions (imported from Calibre)
+CREATE TABLE custom_column_definitions (
+    id SERIAL PRIMARY KEY,
+    label TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    datatype TEXT NOT NULL,  -- text, enum, comments, datetime, rating, bool, int, float, series
+    is_multiple BOOLEAN DEFAULT FALSE,
+    display_order INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Custom column values (unified storage)
+CREATE TABLE custom_column_values (
+    id BIGSERIAL PRIMARY KEY,
+    column_id INTEGER NOT NULL REFERENCES custom_column_definitions(id) ON DELETE CASCADE,
+    book_id INTEGER NOT NULL,  -- References Calibre book ID
+    value TEXT NOT NULL,
+    sort_value TEXT,  -- For sorting
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE(column_id, book_id)
+);
+
+CREATE INDEX idx_ccv_column_book ON custom_column_values(column_id, book_id);
+CREATE INDEX idx_ccv_sort ON custom_column_values(column_id, sort_value);
+```
+
+**Type Mapping (Calibre → Rust):**
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CustomColumnValue {
+    Text(String),
+    Enum(String),
+    Comments(String),
+    DateTime(chrono::DateTime<chrono::Utc>),
+    Rating(i32),  // 0-10 scale
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Series { id: i32, name: String, index: f32 },
+}
+
+impl CustomColumnValue {
+    pub fn from_calibre(datatype: &str, value: &str) -> Result<Self, ConversionError> {
+        match datatype {
+            "text" | "composite" => Ok(Self::Text(value.to_string())),
+            "enum" => Ok(Self::Enum(value.to_string())),
+            "comments" => Ok(Self::Comments(value.to_string())),
+            "datetime" => Ok(Self::DateTime(parse_datetime(value)?)),
+            "rating" => Ok(Self::Rating(value.parse()?)),
+            "bool" => Ok(Self::Bool(value.parse()?)),
+            "int" => Ok(Self::Int(value.parse()?)),
+            "float" => Ok(Self::Float(value.parse()?)),
+            "series" => Ok(Self::Series { /* parse */ }),
+            _ => Err(ConversionError::UnknownType(datatype.to_string())),
+        }
+    }
+}
+```
+
+**Import Process:**
+
+```rust
+pub async fn import_custom_columns(
+    calibre_db: &CalibreDB,
+    pg_pool: &PgPool,
+) -> Result<ImportStats, ImportError> {
+    // 1. Import column definitions from Calibre
+    let columns = calibre_db.get_custom_columns().await?;
+
+    for column in columns {
+        sqlx::query(
+            "INSERT INTO custom_column_definitions (id, label, name, datatype, is_multiple, display_order)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (label) DO UPDATE SET name = EXCLUDED.name, datatype = EXCLUDED.datatype"
+        )
+        .bind(column.id)
+        .bind(&column.label)
+        .bind(&column.name)
+        .bind(&column.datatype)
+        .bind(column.is_multiple)
+        .bind(column.display_order)
+        .execute(pg_pool)
+        .await?;
+    }
+
+    // 2. Import column values in batches
+    let mut conn = pg_pool.begin().await?;
+
+    for column in &columns {
+        let values = calibre_db.get_column_values(column.id).await?;
+
+        for value in values {
+            sqlx::query(
+                "INSERT INTO custom_column_values (column_id, book_id, value, sort_value)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (column_id, book_id) DO UPDATE
+                    SET value = EXCLUDED.value, sort_value = EXCLUDED.sort_value"
+            )
+            .bind(column.id)
+            .bind(value.book_id)
+            .bind(&serialize_value(&value.value, &column.datatype)?)
+            .bind(&value.sort_value)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+
+    conn.commit().await?;
+
+    Ok(ImportStats { columns_imported: columns.len() })
+}
+```
+
+---
 
 ### Key Design Decisions
 
-1. **Calibre Compatibility:**
-   - Same table structure (books, authors, series, etc.)
-   - Same data types (TEXT with NOCASE, INTEGER for has_cover)
-   - Same identifier system (generic identifiers table)
-   - Can import directly from Calibre's SQLite metadata.db
+1. **Two-Database Architecture:**
+   - PostgreSQL for application state (users, sessions, tasks)
+   - SQLite for Calibre library data (read-only)
+   - Maintains Calibre desktop compatibility
+   - Eliminates sync complexity
 
-2. **PostgreSQL Optimizations:**
-   - GIN indexes for full-text search on titles
-   - JSONB for flexible data (tasks, config, metadata)
-   - Array types for efficient filtering (denied_tags, allowed_tags)
-   - Connection pooling for performance
+2. **Calibre Compatibility:**
+   - Direct read access to Calibre's SQLite database
+   - Preserve Calibre's schema structure
+   - No modification of Calibre data
+   - Support all Calibre features (custom columns, etc.)
 
-3. **ID Preservation:**
-   - Keep Calibre's INTEGER IDs for books, authors, etc.
-   - Use UUID for task IDs (security, distributed systems)
-   - Use BIGSERIAL for application tables (users, shelves)
+3. **Custom Columns Support:**
+   - Import column definitions dynamically
+   - Unified storage with JSONB-style approach
+   - Type-safe value conversion
+   - Efficient querying with indexes
+
+4. **Performance Optimizations:**
+   - Connection pooling for both databases
+   - GIN indexes for full-text search (PostgreSQL)
+   - Cached metadata for frequently accessed data
+   - Lazy loading for large objects
 
 ---
 
@@ -589,6 +929,721 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
+```
+
+---
+
+## Authentication & Authorization
+
+### Session Architecture
+
+**Session Storage:** Encrypted Cookies
+
+```
+┌──────────────┐
+│  Browser     │
+│              │  Cookie: {"user_id": 123, "csrf_token": "abc"}
+│  └────────────┘
+│       ↓↑ (encrypted, signed)
+┌──────────────┐
+│  Axum App    │
+│              │  tower-session (encrypted cookies)
+│  └────────────┘
+│       ↓↑
+┌──────────────┐
+│  Database    │
+│              │  - Session not stored in DB
+│  └────────────┘    - Token validated via crypto
+```
+
+**Why Encrypted Cookies?**
+- No Redis required (simpler deployment)
+- No session database queries (faster)
+- Stateless (easier horizontal scaling)
+- Size limit: ~4KB (sufficient for user_id + csrf_token)
+
+**Session Data Structure:**
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionData {
+    pub user_id: i32,
+    pub username: String,
+    pub roles: RoleFlags,
+    pub csrf_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+}
+```
+
+### Multi-Provider Authentication
+
+**Supported Providers:**
+
+1. **Local** - Username/password in PostgreSQL
+2. **LDAP** - Active Directory, OpenLDAP
+3. **OAuth** - Google, GitHub
+
+**Account Linking Strategy:**
+
+```sql
+-- OAuth/LDAP account linking
+CREATE TABLE user_auth_providers (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,  -- 'local', 'ldap', 'google', 'github'
+    provider_user_id TEXT NOT NULL,  -- LDAP DN or OAuth subject
+    provider_email TEXT,
+    profile JSONB,
+    linked_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_used TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, provider, provider_user_id)
+);
+```
+
+**Authentication Flow (LDAP):**
+
+```
+1. User enters username/password
+   ↓
+2. AuthService::authenticate_ldap()
+   ↓
+3. Bind to LDAP server, verify credentials
+   ↓
+4. Check if account exists in user_auth_providers
+   - If yes: Update last_used, create session
+   - If no: Create new user account (provisioning)
+   ↓
+5. Create session with encrypted cookie
+   ↓
+6. Redirect to home
+```
+
+**Authentication Flow (OAuth):**
+
+```
+1. User clicks "Login with Google"
+   ↓
+2. Redirect to Google OAuth 2.0
+   ↓
+3. User authorizes app
+   ↓
+4. Google redirects with authorization code
+   ↓
+5. Exchange code for access token
+   ↓
+6. Fetch user info from Google API
+   ↓
+7. Check if account exists in user_auth_providers
+   - If yes: Update last_used, create session
+   - If no: Create new user account (provisioning)
+   ↓
+8. Create session with encrypted cookie
+   ↓
+9. Redirect to home
+```
+
+### Role-Based Permission System
+
+**Role Bitmask (matching Calibre-Web):**
+
+```rust
+bitflags! {
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
+    pub struct RoleFlags: u64 {
+        const ADMIN       = 1 << 0;  // 1
+        const DOWNLOAD    = 1 << 1;  // 2
+        const UPLOAD      = 1 << 2;  // 4
+        const EDIT        = 1 << 3;  // 8
+        const PASSWD      = 1 << 4;  // 16
+        const ANONYMOUS   = 1 << 5;  // 32
+        const EDIT_SHELVES = 1 << 6; // 64
+        const DELETE_BOOKS = 1 << 7; // 128
+        const VIEWER      = 1 << 8;  // 256
+    }
+}
+
+// Default role sets
+const ADMIN_USER_ROLES: RoleFlags = RoleFlags::all().remove(RoleFlags::ANONYMOUS);
+const STANDARD_USER_ROLES: RoleFlags = RoleFlags::DOWNLOAD.union(RoleFlags::VIEWER);
+const GUEST_USER_ROLES: RoleFlags = RoleFlags::ANONYMOUS.union(RoleFlags::VIEWER);
+```
+
+**Permission Check Extractor:**
+
+```rust
+pub struct RequireRole(RoleFlags);
+
+impl<S> FromRequestParts<S> for RequireRole
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let user = parts
+            .extensions
+            .get::<AuthenticatedUser>()
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+
+        if user.roles.contains(self.0) {
+            Ok(RequireRole(self.0))
+        } else {
+            Err(StatusCode::FORBIDDEN)
+        }
+    }
+}
+
+// Usage in handler
+async fn delete_book(
+    RequireRole(RoleFlags::DELETE_BOOKS): RequireRole,
+    Path(id): Path<i32>,
+) -> Result<Html<String>, AppError> {
+    // Handler logic
+}
+```
+
+---
+
+## File Storage Strategy
+
+### Directory Structure
+
+**Calibre-Compatible Structure:**
+
+```
+/var/lib/calibre-web/
+├── library/                    # Calibre library root (configurable)
+│   ├── author/                  # Calibre's author/title hierarchy
+│   │   └── Author Name/
+│   │       └── Book Title/
+│   │           ├── Book Title.epub
+│   │           ├── cover.jpg
+│   │           └── metadata.opf
+│   └── metadata.db              # Calibre database (SQLite)
+├── covers/                      # Generated thumbnails (cache)
+│   ├── small/                    # 48x48
+│   ├── medium/                   # 128x128
+│   └── large/                    # 256x256
+└── uploads/                     # Temporary upload staging
+    └── temp_123456/
+```
+
+### File Upload Flow
+
+```
+1. User uploads book via web interface
+   ↓
+2. File stored in uploads/temp_XXX/
+   ↓
+3. Extract metadata (title, author, cover, etc.)
+   ↓
+4. Create Calibre-compatible directory structure
+   ↓
+5. Move file to library/author/title/ directory
+   ↓
+6. Generate cover thumbnails
+   ↓
+7. Update Calibre database (via Calibre CLI or direct)
+   ↓
+8. Cleanup temp files
+```
+
+**Upload Service:**
+
+```rust
+pub async fn upload_book(
+    mut uploaded_file: Multipart,
+    user_id: i32,
+    calibre_db: &CalibreDB,
+    config: &LibrarySettings,
+) -> Result<i32, UploadError> {
+    // 1. Save to temp location
+    let temp_dir = config.temp_path.join(format!("temp_{}", user_id));
+    fs::create_dir_all(&temp_dir)?;
+    let file_path = temp_dir.join(&uploaded_file.filename);
+    uploaded_file.copy_to(&file_path).await?;
+
+    // 2. Extract metadata
+    let metadata = extract_metadata(&file_path).await?;
+
+    // 3. Create Calibre directory
+    let author_dir = config.library_path
+        .join("author")
+        .join(&sanitize_filename(&metadata.author));
+    let book_dir = author_dir.join(&sanitize_filename(&metadata.title));
+    fs::create_dir_all(book_dir)?;
+
+    // 4. Move file to final location
+    let final_path = book_dir.join(&uploaded_file.filename);
+    fs::rename(&file_path, &final_path)?;
+
+    // 5. Add to Calibre database
+    let book_id = add_to_calibre_db(calibre_db, &metadata, &final_path).await?;
+
+    // 6. Generate thumbnails
+    generate_cover_thumbnails(book_id, &metadata.cover_path).await?;
+
+    Ok(book_id)
+}
+```
+
+### Cover Image Handling
+
+**Cover Storage:**
+
+```
+Covers are stored in Calibre's directory structure:
+- library/author/title/cover.jpg (original)
+
+Thumbnails are generated and cached:
+- covers/small/48x48/BOOK_ID.jpg
+- covers/medium/128x128/BOOK_ID.jpg
+- covers/large/256x256/BOOK_ID.jpg
+```
+
+**Thumbnail Generation:**
+
+```rust
+pub async fn generate_cover_thumbnails(
+    book_id: i32,
+    cover_path: &Path,
+) -> Result<(), CoverError> {
+    let img = image::open(cover_path)?;
+
+    // Generate thumbnails
+    let sizes = [
+        (48, "small"),
+        (128, "medium"),
+        (256, "large"),
+    ];
+
+    for (size, dir_name) in sizes {
+        let thumbnail_dir = PathBuf::from("/covers").join(dir_name);
+        fs::create_dir_all(&thumbnail_dir)?;
+
+        let thumbnail = img.thumbnail_exact(size, size);
+        let thumbnail_path = thumbnail_dir.join(format!("{}.jpg", book_id));
+        thumbnail.save(&thumbnail_path)?;
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## Background Task System (Detailed)
+
+### Task Database Schema
+
+```sql
+CREATE TABLE tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_type TEXT NOT NULL,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    status TEXT NOT NULL,  -- pending, running, completed, failed, cancelled
+    priority INTEGER DEFAULT 0,  -- 0=low, 1=normal, 2=high
+    progress INTEGER DEFAULT 0,
+    result JSONB,
+    error_message TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
+    worker_id TEXT,  -- Which worker is processing
+    last_heartbeat TIMESTAMP
+);
+
+CREATE INDEX idx_tasks_status_priority ON tasks(status, priority DESC, created_at);
+CREATE INDEX idx_tasks_user_pending ON tasks(user_id, status) WHERE status = 'pending';
+```
+
+### Task Lifecycle State Machine
+
+```
+┌──────────┐
+│ PENDING  │  Created, waiting for worker
+└─────┬────┘
+      │
+      ▼
+┌──────────┐
+│ RUNNING  │  Worker processing, progress updates
+└─────┬────┘
+      │
+      ├───────────────┬──────────────┐
+      ▼                   ▼              ▼
+┌──────────┐      ┌──────────┐  ┌──────────┐
+│ COMPLETED│      │  FAILED   │  │ CANCELLED│
+└──────────┘      └──────────┘  └──────────┘
+     │                  │              │
+     ▼                  ▼              ▼
+  Result stored     Retry?        Cleanup
+```
+
+**Task Recovery on Restart:**
+
+```rust
+// On application startup
+pub async fn recover_stuck_tasks(pool: &PgPool) -> Result<(), TaskError> {
+    // Find tasks stuck in 'running' status
+    let stuck_tasks = sqlx::query_as::<_, Task>(
+        "SELECT * FROM tasks
+         WHERE status = 'running'
+         AND (last_heartbeat < NOW() - INTERVAL '5 minutes'
+              OR started_at < NOW() - INTERVAL '1 hour')"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for task in stuck_tasks {
+        // Reset to pending with retry count increment
+        sqlx::query(
+            "UPDATE tasks
+             SET status = 'pending',
+                 worker_id = NULL,
+                 retry_count = retry_count + 1,
+                 updated_at = NOW()
+             WHERE id = $1"
+        )
+        .bind(task.id)
+        .execute(pool)
+        .await?;
+
+        // Max retries exceeded?
+        if task.retry_count >= task.max_retries {
+            sqlx::query(
+                "UPDATE tasks
+                 SET status = 'failed',
+                     error_message = 'Max retries exceeded',
+                     completed_at = NOW()
+                 WHERE id = $1"
+            )
+            .bind(task.id)
+            .execute(pool)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+```
+
+### Resource Management
+
+**Concurrency Limits:**
+
+```rust
+// Max concurrent tasks per type
+pub struct TaskLimits {
+    pub max_conversions: usize,     // 3 (CPU intensive)
+    pub max_thumbnails: usize,       // 5 (I/O bound)
+    pub max_uploads: usize,          // 2 (file I/O)
+    pub max_metadata: usize,        // 10 (network I/O)
+}
+
+// Worker resource tracking
+pub struct WorkerState {
+    pub active_conversions: Semaphore,
+    pub active_thumbnails: Semaphore,
+    pub active_uploads: Semaphore,
+}
+```
+
+**Timeout Handling:**
+
+```rust
+pub async fn execute_with_timeout<F, T>(
+    task_id: Uuid,
+    pool: &PgPool,
+    timeout: Duration,
+    f: F,
+) -> Result<T, TaskError>
+where
+    F: Future<Output = Result<T, TaskError>>,
+{
+    let result = tokio::time::timeout(timeout, f).await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => {
+            // Mark task as failed due to timeout
+            sqlx::query(
+                "UPDATE tasks
+                 SET status = 'failed',
+                     error_message = 'Task timeout',
+                     completed_at = NOW()
+                 WHERE id = $1"
+            )
+            .bind(task_id)
+            .execute(pool)
+            .await?;
+
+            Err(TaskError::Timeout)
+        }
+    }
+}
+```
+
+---
+
+## Security Considerations
+
+### Threat Model
+
+**Assets to Protect:**
+1. User credentials (passwords, sessions)
+2. eBook files (copyrighted content)
+3. User data (reading history, preferences)
+4. Administrative access
+
+**Threat Actors:**
+1. **Unauthorized users** - Attempting to access without login
+2. **Authorized users** - Accessing beyond permissions
+3. **Anonymous users** - Exploiting vulnerabilities
+4. **Insiders** - Legitimate users with malicious intent
+
+### Security Checklist
+
+**Input Validation:**
+- [ ] All user input sanitized (SQL injection prevention)
+- [ ] File upload validation (type, size limits, magic bytes)
+- [ ] URL parameter validation
+- [ ] Form field validation (garde or validator)
+
+**Authentication:**
+- [ ] Argon2 password hashing (memory-hard)
+- [ ] Secure session generation (random 32 bytes)
+- [ ] Session timeout (30 days configurable)
+- [ ] Password strength requirements (enforced in UI)
+- [ ] Account lockout after failed attempts
+
+**Authorization:**
+- [ ] Role-based access control on all operations
+- [ ] Content filtering per user (denied_tags, allowed_tags)
+- [ ] Shelf visibility checks
+- [ ] Admin operation audit logging
+
+**Data Protection:**
+- [ ] HTTPS enforced in production
+- [ ] CSP headers configured
+- [ ] XSS prevention (template auto-escaping)
+- [ ] CSRF protection on all state-changing operations
+- [ ] SQL injection prevention (SQLx compile-time checks)
+- [ ] File system path traversal prevention
+
+**Rate Limiting:**
+- [ ] OPDS: 3 req/min per IP
+- [ ] Login: 5 attempts/min per IP
+- [ ] API: 10 req/min per user
+- [ ] Uploads: 10 per hour per user
+
+**Secrets Management:**
+- [ ] SECRET_KEY generated with `openssl rand -hex 32`
+- [ ] Secrets never in code (environment variables only)
+- [ ] Secret rotation policy documented
+- [ ] API keys encrypted in database
+
+**Dependency Security:**
+- [ ] Regular dependency updates (`cargo audit`)
+- [ ] Vulnerability scanning (cargo-audit)
+- [ ] Only necessary dependencies included
+
+### Security Headers
+
+```rust
+// src/web/middleware/security.rs
+
+use axum::{
+    http::{header::HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+
+pub async fn security_headers() -> impl IntoResponse {
+    let headers = [
+        ("Strict-Transport-Security", "max-age=31536000; includeSubDomains"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        ("X-XSS-Protection", "1; mode=block"),
+        ("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:"),
+        ("Referrer-Policy", "strict-origin-when-cross-origin"),
+        ("Permissions-Policy", "geolocation=(), microphone=()"),
+    ];
+
+    // Apply to all responses via middleware
+}
+```
+
+---
+
+## Migration Strategy
+
+### Migration Tool Design
+
+**Command-Line Tool:**
+
+```bash
+# Import from existing Calibre library
+calibre-web-rust import \
+    --calibre-db /path/to/metadata.db \
+    --library-path /path/to/calibre/library \
+    --users-from-csv users.csv \
+    --create-admin-admin \
+    --dry-run
+```
+
+**Migration Process:**
+
+```rust
+// src/domain/import/migration.rs
+
+pub struct CalibreMigrator {
+    calibre_db: CalibreDB,
+    app_db: PgPool,
+    config: MigrationConfig,
+}
+
+impl CalibreMigrator {
+    pub async fn migrate(&self) -> Result<MigrationReport, MigrationError> {
+        let report = MigrationReport::default();
+
+        // 1. Validate Calibre database
+        self.validate_calibre_db().await?;
+
+        // 2. Migrate books with relations
+        report.books = self.migrate_books().await?;
+
+        // 3. Migrate custom columns
+        report.custom_columns = self.migrate_custom_columns().await?;
+
+        // 4. Import users (if CSV provided)
+        if let Some(users_csv) = &self.config.users_csv {
+            report.users = self.import_users(users_csv).await?;
+        }
+
+        // 5. Validate migration
+        self.validate_migration().await?;
+
+        Ok(report)
+    }
+
+    async fn migrate_books(&self) -> Result<i32, MigrationError> {
+        let mut imported = 0;
+
+        // Read books from Calibre
+        let books = self.calibre_db.get_all_books().await?;
+
+        // Use transaction for atomicity
+        let mut tx = self.app_db.begin().await?;
+
+        for book in &books {
+            // Check if book exists (by UUID)
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM books WHERE uuid = $1"
+            )
+            .bind(&book.uuid)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if exists == 0 {
+                // Book doesn't exist, import it
+                // Note: We DON'T copy book data to PostgreSQL
+                // We only track metadata for faster searching
+                sqlx::query(
+                    "INSERT INTO imported_books (book_id, uuid, title, author_sort, path)
+                     VALUES ($1, $2, $3, $4, $5)"
+                )
+                .bind(book.id)
+                .bind(&book.uuid)
+                .bind(&book.title)
+                .bind(&book.author_sort)
+                .bind(&book.path)
+                .execute(&mut *tx)
+                .await?;
+
+                imported += 1;
+            }
+
+            // Import relations (authors, tags, series, etc.)
+            self.import_book_relations(&mut tx, book).await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(imported)
+    }
+}
+```
+
+**Imported Books Tracking Table:**
+
+```sql
+CREATE TABLE imported_books (
+    book_id INTEGER PRIMARY KEY,  -- Calibre book ID
+    uuid TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    author_sort TEXT,
+    path TEXT NOT NULL,
+    imported_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_synced TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_imported_books_uuid ON imported_books(uuid);
+CREATE INDEX idx_imported_books_title ON imported_books USING GIN(to_tsvector('english', title));
+```
+
+**Migration Validation:**
+
+```rust
+pub async fn validate_migration(&self) -> Result<ValidationReport, MigrationError> {
+    let mut report = ValidationReport::default();
+
+    // 1. Check all books are accessible
+    let total_books = self.calibre_db.count_books().await?;
+    let accessible_books = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM imported_books")
+        .fetch_one(&self.app_db)
+        .await?;
+
+    report.books_accessible = (accessible_books == total_books);
+
+    // 2. Check file paths are valid
+    let books_with_missing_files = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM imported_books
+         WHERE NOT EXISTS (SELECT 1 FROM pg_stat_file(path) WHERE path = imported_books.path)"
+    )
+    .fetch_one(&self.app_db)
+    .await?;
+
+    report.all_files_accessible = (books_with_missing_files == 0);
+
+    // 3. Check custom columns imported
+    let calibre_columns = self.calibre_db.count_custom_columns().await?;
+    let imported_columns = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM custom_column_definitions")
+        .fetch_one(&self.app_db)
+        .await?;
+
+    report.custom_columns_imported = (imported_columns == calibre_columns);
+
+    Ok(report)
+}
+```
+
+**Zero-Downtime Migration (Optional):**
+
+```
+1. Deploy Rust version alongside Python version (different port)
+2. Configure reverse proxy to route to both
+3. Run import process (reads from Calibre DB)
+4. Validate migration
+5. Switch proxy to Rust version
+6. Monitor for issues
+7. Deprecate Python version
 ```
 
 ---
