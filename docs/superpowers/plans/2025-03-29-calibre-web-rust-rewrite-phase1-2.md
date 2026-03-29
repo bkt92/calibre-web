@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a functional Calibre-Web rewrite in Rust with local authentication, book browsing, and search capabilities.
+**Goal:** Build a functional Calibre-Web rewrite in Rust with local authentication, book browsing, search capabilities, and Calibre library import.
 
-**Architecture:** Axum web framework with Tokio async runtime, PostgreSQL for application state, SQLite for Calibre data (read-only), Tera templating for Jinja2-compatible templates, and Moka for in-memory caching.
+**Architecture:** Axum web framework with Tokio async runtime, **PostgreSQL as single source of truth** (all data), Calibre SQLite as portable import/export format, Tera templating, and Moka for in-memory caching. Bidirectional sync maintains Calibre Desktop compatibility.
 
-**Tech Stack:** Axum 0.7+, Tokio 1.35+, SQLx 0.7+, Tera 0.20+, Moka 0.12+, argon2 0.5+, tower-authz, tracing 0.1+
+**Tech Stack:** Axum 0.7+, Tokio 1.35+, SQLx 0.7+, Tera 0.20+, Moka 0.12+, argon2 0.5+, tower-sessions, tracing 0.1+
 
-**Reference Spec:** `docs/superpowers/specs/2025-03-29-calibre-web-rust-rewrite-design.md`
+**Reference Specs:**
+- `docs/superpowers/specs/2025-03-29-calibre-web-rust-rewrite-design.md`
+- `docs/superpowers/specs/2025-03-29-calibre-sync-strategy.md`
 
 ---
 
@@ -28,19 +30,25 @@ calibre-web-rust/
 │   │   ├── database/
 │   │   │   ├── mod.rs                  # Database module root
 │   │   │   ├── postgres.rs             # PostgreSQL connection
-│   │   │   ├── calibre.rs              # Calibre SQLite (rusqlite)
 │   │   │   └── migrations.rs           # Migration runner
 │   │   ├── cache/
 │   │   │   └── mod.rs                  # Moka cache setup
-│   │   └── auth/
-│   │       └── mod.rs                  # Password hashing (argon2)
+│   │   ├── auth/
+│   │   │   └── mod.rs                  # Password hashing (argon2)
+│   │   └── sync/
+│   │       ├── mod.rs                  # Sync module root
+│   │       ├── calibre_import.rs       # Import from Calibre SQLite
+│   │       ├── calibre_export.rs       # Export to Calibre SQLite
+│   │       └── bidirectional_sync.rs   # Bidirectional sync
 │   ├── domain/
 │   │   ├── users/
 │   │   │   ├── mod.rs                  # User domain logic
 │   │   │   └── repository.rs           # User repository
-│   │   └── books/
-│   │       ├── mod.rs                  # Book domain logic
-│   │       └── repository.rs           # Book repository
+│   │   ├── books/
+│   │   │   ├── mod.rs                  # Book domain logic
+│   │   │   └── repository.rs           # Book repository (PostgreSQL)
+│   │   └── sync/
+│   │       └── mod.rs                  # Sync domain logic
 │   ├── web/
 │   │   ├── mod.rs                      # Web module root
 │   │   ├── routes/
@@ -51,13 +59,15 @@ calibre-web-rust/
 │   │   ├── middleware/
 │   │   │   ├── mod.rs                  # Middleware module root
 │   │   │   └── auth.rs                 # Authentication middleware
-│   │   └── extractors/
-│   │       ├── mod.rs                  # Extractors module root
-│   │       └── auth.rs                 # User extractors
+│   │   ├── extractors/
+│   │   │   ├── mod.rs                  # Extractors module root
+│   │   │   └── auth.rs                 # User extractors
+│   │   └── session/
+│   │       └── mod.rs                  # Session management
 │   └── templates/
 │       └── mod.rs                      # Tera template wrapper
 ├── migrations/
-│   └── 001_initial.up.sql              # Initial schema
+│   └── 001_initial.up.sql              # Initial schema (includes books!)
 ├── templates/
 │   ├── base.html                       # Base template
 │   ├── login.html                      # Login page
@@ -69,7 +79,8 @@ calibre-web-rust/
 ├── tests/
 │   ├── integration/
 │   │   ├── auth_tests.rs               # Auth integration tests
-│   │   └── books_tests.rs              # Books integration tests
+│   │   ├── books_tests.rs              # Books integration tests
+│   │   └── sync_tests.rs               # Sync integration tests
 │   └── helpers.rs                      # Test helpers
 ├── config/
 │   ├── default.toml                    # Default configuration
