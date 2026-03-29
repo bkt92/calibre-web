@@ -1,0 +1,23 @@
+# Local development configuration example
+#
+# Copy this file to local.toml and customize for your local development setup.
+# Values in local.toml override the defaults in default.toml.
+#
+# Alternatively, you can use environment variables with the CALIBRE_WEB__ prefix:
+# - CALIBRE_WEB__DATABASE__URL=postgresql://user:pass@localhost/dbname
+# - CALIBRE_WEB__SERVER__PORT=8083
+# - CALIBRE_WEB__LIBRARY__LIBRARY_PATH=./dev-data/library
+
+# Override database URL for local development
+[database]
+url = "postgresql://calibre_web:password@localhost/calibre_web_dev"
+
+# Use different port locally (if needed)
+[server]
+port = 8083
+
+# Local library paths
+[library]
+library_path = "./dev-data/library"
+cover_path = "./dev-data/covers"
+upload_path = "./dev-data/upload"

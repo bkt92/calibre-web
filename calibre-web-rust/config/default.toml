@@ -1,0 +1,27 @@
+# Default configuration for Calibre-Web Rust
+#
+# This file contains the default settings. To override these values
+# for local development, create a config/local.toml file or use
+# environment variables with the CALIBRE_WEB__ prefix.
+
+[database]
+# PostgreSQL connection URL
+url = "postgresql://calibre_web:password@localhost/calibre_web"
+# Maximum number of database connections in the pool
+max_connections = 10
+
+[server]
+# Host address to bind to (0.0.0.0 for all interfaces, 127.0.0.1 for local only)
+host = "127.0.0.1"
+# Port number to listen on
+port = 8083
+# Number of worker threads for handling requests
+workers = 4
+
+[library]
+# Path to the Calibre library directory
+library_path = "/var/lib/calibre-web/library"
+# Path to store cached book covers
+cover_path = "/var/lib/calibre-web/covers"
+# Path to store uploaded files
+upload_path = "/var/lib/calibre-web/upload"
