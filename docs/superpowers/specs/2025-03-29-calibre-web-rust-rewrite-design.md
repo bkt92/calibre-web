@@ -193,41 +193,70 @@ calibre-web-rust/
 
 ## Database Design
 
-### Architecture Decision: Two-Database Strategy
+### Architecture Decision: Single Source of Truth with Synchronization
 
-**CRITICAL DECISION:** This system uses **TWO databases** to maintain compatibility with Calibre desktop while optimizing performance.
+**CRITICAL DECISION:** This system uses **PostgreSQL as the single source of truth** with Calibre SQLite (metadata.db) as a portable import/export format. Bidirectional synchronization maintains Calibre Desktop compatibility.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Calibre-Web Application                 │
+│              Calibre-Web Rust Application                 │
 │                                                              │
-│  ┌──────────────────────┐        ┌──────────────────────┐ │
-│  │  PostgreSQL          │        │  Calibre SQLite       │ │
-│  │  (Application DB)     │        │  (metadata.db)        │ │
-│  │                      │        │                       │ │
-│  │  - users             │        │  - books              │ │
-│  │  - sessions          │        │  - authors            │ │
-│  │  - shelves           │        │  - series             │ │
-│  │  - tasks             │        │  - tags                │ │
-│  │  - config            │        │  - custom_columns      │ │
-│  │  - permissions       │        │  - data (formats)      │ │
-│  └──────────────────────┘        └──────────────────────┘ │
-│         ↓↑                                    ↓↑           │
-│    Read/Write                            Read-Only        │
-│    (SQLx)                               (rusqlite)       │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  PostgreSQL (Single Source of Truth)              │   │
+│  │                                                     │   │
+│  │  Books, Authors, Series, Tags                       │   │
+│  │  Users, Sessions, Shelves, Tasks                    │   │
+│  │  Config, Permissions, Custom Columns                │   │
+│  │  All Book Formats and Metadata                      │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ↑↓                                 │
+│              ┌──────────────────────┐                      │
+│              │  Sync Layer         │                      │
+│              │  (Import/Export)    │                      │
+│              └──────────────────────┘                      │
+│                          ↑↓                                 │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Calibre SQLite (metadata.db)                      │   │
+│  │  - Portable Import/Export Format                     │   │
+│  │  - Calibre Desktop Compatibility                    │   │
+│  │  - Backup/Restore Capability                        │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                              │
+│  Sync Modes:                                                │
+│  - Import: Calibre → PostgreSQL (initial migration)        │
+│  - Export: PostgreSQL → Calibre (backup)                  │
+│  - Bidirectional: Keep both in sync (optional)            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Why Two Databases?**
+**Why PostgreSQL as Single Source of Truth?**
 
-1. **Calibre Desktop Compatibility** - Users can continue using Calibre desktop to manage their library
-2. **No Migration Friction** - Books added via Calibre desktop immediately available
-3. **Performance** - PostgreSQL for application state (concurrent writes, complex queries)
-4. **Simplicity** - Read-only access to Calibre data eliminates sync complexity
+1. **Full CRUD Control** - Complete control over book add/edit/delete operations
+2. **Performance** - All queries in PostgreSQL (no SQLite limitations)
+3. **Concurrency** - No SQLite file locking issues
+4. **Scalability** - PostgreSQL handles concurrent writes better
+5. **Simpler Architecture** - One primary database, no two-database coordination
+6. **Advanced Features** - Full-text search, JSONB, triggers, etc.
+
+**Why Keep Calibre SQLite?**
+
+1. **Calibre Compatibility** - Import/export maintains Calibre Desktop interoperability
+2. **Portable Format** - metadata.db is a self-contained library backup
+3. **Migration Path** - Easy import from existing Calibre libraries
+4. **Fallback Option** - Can export to Calibre format if needed
+
+**Sync Strategy:**
+
+See [Calibre Sync Strategy](./2025-03-29-calibre-sync-strategy.md) for complete details on:
+- Bidirectional synchronization algorithm
+- Conflict resolution strategies (last-write-wins, PostgreSQL-wins, manual)
+- Change detection and incremental sync
+- Error handling and rollback
+- Performance optimization
 
 **Database Technologies:**
-- **Application DB:** PostgreSQL 15+ (via SQLx)
-- **Calibre DB:** SQLite (via rusqlite, read-only)
+- **Primary DB:** PostgreSQL 15+ (via SQLx) - Single source of truth
+- **Portable Format:** SQLite (via rusqlite) - Import/export/sync source
 
 ---
 
@@ -361,15 +390,198 @@ CREATE TABLE calibre_imports (
     imported_book_ids INTEGER[],
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+-- Sync state tracking
+CREATE TABLE sync_state (
+    id SERIAL PRIMARY KEY,
+    sync_id UUID UNIQUE NOT NULL,
+    source TEXT NOT NULL,  -- 'calibre_sqlite' or 'postgresql'
+    started_at TIMESTAMP NOT NULL,
+    completed_at TIMESTAMP,
+    status TEXT NOT NULL,  -- running, completed, failed, rolled_back
+    pg_changes_detected INTEGER DEFAULT 0,
+    sqlite_changes_detected INTEGER DEFAULT 0,
+    conflicts_resolved INTEGER DEFAULT 0,
+    errors TEXT[],
+    rollback_data JSONB
+);
+
+-- Sync conflicts (for manual resolution)
+CREATE TABLE sync_conflicts (
+    id SERIAL PRIMARY KEY,
+    sync_id UUID NOT NULL REFERENCES sync_state(id),
+    book_id INTEGER NOT NULL,
+    conflict_type TEXT NOT NULL,  -- title, author, tags, cover, etc.
+    pg_value JSONB,
+    sqlite_value JSONB,
+    resolution TEXT,  -- 'pg_wins', 'sqlite_wins', 'pending', 'manual'
+    resolved_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
 ```
 
 ---
 
-### Calibre Database Access (SQLite - Read-Only)
+### Books Schema (PostgreSQL)
 
-**Calibre Schema (Accessed via rusqlite):**
+**Primary Book Storage:**
 
-The application reads directly from Calibre's `metadata.db`:
+```sql
+-- Books (all data from Calibre, now in PostgreSQL)
+CREATE TABLE books (
+    id SERIAL PRIMARY KEY,
+    uuid UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
+    title TEXT NOT NULL,
+    sort TEXT,  -- Title for sorting (e.g., "Book, The")
+    author_sort TEXT,
+    timestamp TIMESTAMP DEFAULT NOW(),
+    pubdate TIMESTAMP,
+    series_index FLOAT,
+    last_modified TIMESTAMP DEFAULT NOW(),
+    path TEXT NOT NULL,  -- File path to book directory
+    has_cover BOOLEAN DEFAULT FALSE,
+
+    -- Calibre compatibility
+    calibre_book_id INTEGER,  -- Original Calibre book ID (for tracking)
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_books_title ON books USING GIN(to_tsvector('english', title));
+CREATE INDEX idx_books_author_sort ON books(author_sort);
+CREATE INDEX idx_books_timestamp ON books(timestamp DESC);
+CREATE INDEX idx_books_last_modified ON books(last_modified);
+
+-- Authors (many-to-many)
+CREATE TABLE authors (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    sort TEXT,  -- Author name for sorting (e.g., "Name, First")
+    UNIQUE(name, sort)
+);
+
+CREATE TABLE books_authors_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    author_id INTEGER NOT NULL REFERENCES authors(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, author_id)
+);
+
+CREATE INDEX idx_books_authors_link_book ON books_authors_link(book_id);
+CREATE INDEX idx_books_authors_link_author ON books_authors_link(author_id);
+
+-- Series (many-to-many)
+CREATE TABLE series (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    sort TEXT,
+    UNIQUE(name)
+);
+
+CREATE TABLE books_series_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    series_index FLOAT,
+    PRIMARY KEY (book_id, series_id)
+);
+
+CREATE INDEX idx_books_series_link_book ON books_series_link(book_id);
+CREATE INDEX idx_books_series_link_series ON books_series_link(series_id);
+
+-- Tags (many-to-many)
+CREATE TABLE tags (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE books_tags_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, tag_id)
+);
+
+CREATE INDEX idx_books_tags_link_book ON books_tags_link(book_id);
+CREATE INDEX idx_books_tags_link_tag ON books_tags_link(tag_id);
+
+-- Languages (many-to-many)
+CREATE TABLE languages (
+    id SERIAL PRIMARY KEY,
+    language_code TEXT NOT NULL UNIQUE,  -- e.g., 'eng', 'spa'
+    name TEXT NOT NULL
+);
+
+CREATE TABLE books_languages_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    language_id INTEGER NOT NULL REFERENCES languages(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, language_id)
+);
+
+-- Publishers (many-to-many)
+CREATE TABLE publishers (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    UNIQUE(name)
+);
+
+CREATE TABLE books_publishers_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    publisher_id INTEGER NOT NULL REFERENCES publishers(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, publisher_id)
+);
+
+-- Identifiers (ISBN, ASIN, Goodreads, etc.)
+CREATE TABLE book_identifiers (
+    id SERIAL PRIMARY KEY,
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    identifier_type TEXT NOT NULL,  -- 'isbn', 'asin', 'goodreads', 'uuid'
+    identifier_val TEXT NOT NULL,
+    UNIQUE(book_id, identifier_type)
+);
+
+CREATE INDEX idx_book_identifiers_book ON book_identifiers(book_id);
+CREATE INDEX idx_book_identifiers_type_val ON book_identifiers(identifier_type, identifier_val);
+
+-- Comments (book descriptions)
+CREATE TABLE book_comments (
+    book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+    text TEXT NOT NULL  -- HTML content
+);
+
+-- Data (eBook formats)
+CREATE TABLE book_data (
+    id SERIAL PRIMARY KEY,
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    format TEXT NOT NULL,  -- 'EPUB', 'MOBI', 'PDF', 'AZW3', etc.
+    uncompressed_size BIGINT,
+    file_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    UNIQUE(book_id, format)
+);
+
+CREATE INDEX idx_book_data_book ON book_data(book_id);
+CREATE INDEX idx_book_data_format ON book_data(format);
+
+-- Ratings (many-to-many)
+CREATE TABLE ratings (
+    id SERIAL PRIMARY KEY,
+    rating INTEGER NOT NULL CHECK (rating BETWEEN 0 AND 10),
+    name TEXT NOT NULL UNIQUE  -- e.g., '0 stars', '1 star', etc.
+);
+
+CREATE TABLE books_ratings_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    rating_id INTEGER NOT NULL REFERENCES ratings(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, rating_id)
+);
+```
+
+---
+
+### Calibre SQLite Import/Export/Sync
+
+**Calibre Schema (for import/export):**
+
+The application can import from, export to, and sync with Calibre's `metadata.db`:
 
 - `books` - Main book records
 - `authors` - Author information
@@ -384,20 +596,39 @@ The application reads directly from Calibre's `metadata.db`:
 - `custom_column_*` - Dynamic custom columns
 - `books_*_link` - Association tables
 
-**Connection Management:**
+**Import/Export Connection:**
 
 ```rust
-// src/infrastructure/database/calibre.rs
+// src/domain/sync/calibre_import.rs
 
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-pub struct CalibreDB {
-    pool: r2d2::Pool<rusqlite::Connection>,
+pub struct CalibreImporter {
+    pg_pool: PgPool,
 }
 
-impl CalibreDB {
-    pub fn new(db_path: PathBuf) -> Result<Self, CalibreError> {
+impl CalibreImporter {
+    pub async fn import_from_sqlite(
+        &self,
+        sqlite_path: &Path,
+    ) -> Result<ImportStats, ImportError> {
+        // Open Calibre SQLite database
+        let conn = Connection::open(sqlite_path)?;
+
+        // Import books with all relations
+        self.import_books(&conn).await?;
+        self.import_authors(&conn).await?;
+        // ... etc
+
+        Ok(ImportStats {
+            books_imported: 100,
+        })
+    }
+}
+```
+
+**For complete sync strategy details, see:** [Calibre Sync Strategy](./2025-03-29-calibre-sync-strategy.md)
         let pool = r2d2::Pool::builder()
             .max_size(5)  // Read-only needs fewer connections
             .build(rusqlite::SqliteConnection::open(db_path))?;
