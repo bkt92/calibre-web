@@ -1,37 +1,31 @@
-### Python ###
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Rust
+/target/
+calibre-web-rust/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
 
-# Distribution / packaging
-.Python
-.python-version
-env/
-venv/
-eggs/
-dist/
-executable/
-build/
-vendor/
-.eggs/
-*.egg-info/
-.installed.cfg
-*.egg
-.pylint.d
-
-# calibre-web
-*.db
-*.log
-cps/cache
-
+# IDE
 .idea/
-*.bak
-*.log.*
-.key
+.vscode/
+*.swp
+*.swo
+*~
 
-settings.yaml
-gdrive_credentials
-client_secrets.json
-gmail.json
-/.key
+# Python (legacy)
+legacy/__pycache__/
+legacy/*.py[cod]
+legacy/$pyclass/
+legacy/.venv/
+legacy/venv/
+legacy/ENV/
+legacy/.env
+legacy/metadata.db
+legacy/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Calibre library
+legacy/library/
