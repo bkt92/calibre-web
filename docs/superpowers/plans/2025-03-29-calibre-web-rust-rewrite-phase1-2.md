@@ -670,7 +670,7 @@ CREATE TABLE users (
 CREATE INDEX idx_users_username ON users(username);
 CREATE INDEX idx_users_email ON users(email);
 
--- Sessions
+-- Sessions (for tracking session metadata only - actual data in encrypted cookies)
 CREATE TABLE user_sessions (
     id BIGSERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -681,6 +681,175 @@ CREATE TABLE user_sessions (
 
 CREATE INDEX idx_user_sessions_token ON user_sessions(session_token);
 CREATE INDEX idx_user_sessions_expires ON user_sessions(expires_at);
+
+-- Books (imported from Calibre)
+CREATE TABLE books (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    sort TEXT,
+    author_sort TEXT,
+    timestamp TIMESTAMP DEFAULT NOW(),
+    pubdate TIMESTAMP,
+    series_index FLOAT,
+    last_modified TIMESTAMP NOT NULL DEFAULT NOW(),
+    path TEXT NOT NULL,
+    has_cover BOOLEAN DEFAULT FALSE,
+    uuid UUID NOT NULL DEFAULT uuid_generate_v4(),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_books_timestamp ON books(timestamp DESC);
+CREATE INDEX idx_books_last_modified ON books(last_modified);
+CREATE INDEX idx_books_uuid ON books(uuid);
+
+-- Authors
+CREATE TABLE authors (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    sort TEXT,
+    link TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_authors_name ON authors(name);
+
+-- Series
+CREATE TABLE series (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    sort TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_series_name ON series(name);
+
+-- Tags
+CREATE TABLE tags (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_tags_name ON tags(name);
+
+-- Languages
+CREATE TABLE languages (
+    id SERIAL PRIMARY KEY,
+    lang_code TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Publishers
+CREATE TABLE publishers (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_publishers_name ON publishers(name);
+
+-- Many-to-many relationships
+CREATE TABLE books_authors_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    author_id INTEGER NOT NULL REFERENCES authors(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, author_id)
+);
+
+CREATE TABLE books_series_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    series_index FLOAT,
+    PRIMARY KEY (book_id, series_id)
+);
+
+CREATE TABLE books_tags_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, tag_id)
+);
+
+CREATE TABLE books_languages_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    lang_id INTEGER NOT NULL REFERENCES languages(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, lang_id)
+);
+
+CREATE TABLE books_publishers_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    publisher_id INTEGER NOT NULL REFERENCES publishers(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, publisher_id)
+);
+
+-- Book identifiers (ISBN, etc.)
+CREATE TABLE book_identifiers (
+    id SERIAL PRIMARY KEY,
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    val TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_book_identifiers_book ON book_identifiers(book_id);
+
+-- Book comments
+CREATE TABLE book_comments (
+    id SERIAL PRIMARY KEY,
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Book data (formats)
+CREATE TABLE book_data (
+    id SERIAL PRIMARY KEY,
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    format TEXT NOT NULL,
+    uncompressed_size BIGINT,
+    name TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_book_data_book ON book_data(book_id);
+
+-- Ratings
+CREATE TABLE ratings (
+    id SERIAL PRIMARY KEY,
+    rating FLOAT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE books_ratings_link (
+    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    rating_id INTEGER NOT NULL REFERENCES ratings(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, rating_id)
+);
+
+-- Sync state tracking
+CREATE TABLE sync_state (
+    id BIGSERIAL PRIMARY KEY,
+    last_sync_at TIMESTAMP,
+    last_book_id_synced INTEGER DEFAULT 0,
+    sync_status TEXT DEFAULT 'idle',
+    conflict_resolution_strategy TEXT DEFAULT 'last_write_wins',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Sync conflicts (for manual resolution)
+CREATE TABLE sync_conflicts (
+    id BIGSERIAL PRIMARY KEY,
+    sync_id BIGINT REFERENCES sync_state(id),
+    table_name TEXT NOT NULL,
+    record_id INTEGER NOT NULL,
+    conflict_type TEXT NOT NULL,
+    postgresql_data JSONB,
+    sqlite_data JSONB,
+    resolved BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_sync_conflicts_resolved ON sync_conflicts(resolved);
 ```
 
 - [ ] **Step 4: Implement PostgreSQL connection pool**
@@ -780,27 +949,31 @@ git commit -m "feat: implement PostgreSQL connection pool and migration system"
 
 ---
 
-## Task 5: Database Layer - Calibre SQLite (Read-Only)
+## Task 5: Calibre Import Tool
+
+**Purpose:** Import books from Calibre's metadata.db into PostgreSQL
+
+**Dependencies:** Task 4 (PostgreSQL schema with book tables must exist)
 
 **Files:**
-- Create: `src/infrastructure/database/calibre.rs`
-- Modify: `src/infrastructure/database/mod.rs`
-- Create: `tests/calibre_db_tests.rs`
+- Create: `src/infrastructure/sync/mod.rs`
+- Create: `src/infrastructure/sync/calibre_import.rs`
+- Create: `tests/import_tests.rs`
+- Modify: `Cargo.toml` (add rusqlite dependencies)
 
-- [ ] **Step 1: Write failing test for Calibre database connection**
+- [ ] **Step 1: Write failing test for Calibre import**
 
 ```rust
-// tests/calibre_db_tests.rs
-use calibre_web_rust::infrastructure::database::calibre::CalibreDB;
+// tests/import_tests.rs
+use calibre_web_rust::infrastructure::sync::calibre_import::{CalibreImporter, ImportStats};
+use calibre_web_rust::infrastructure::database::create_postgres_pool;
 use tempfile::TempDir;
+use rusqlite::Connection;
 
-#[test]
-fn test_create_calibre_db() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("metadata.db");
+fn create_test_calibre_db(db_path: &std::path::Path) {
+    let conn = Connection::open(db_path).unwrap();
 
-    // Create a minimal Calibre database structure
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    // Create Calibre schema
     conn.execute(
         "CREATE TABLE books (
             id INTEGER PRIMARY KEY,
@@ -810,144 +983,365 @@ fn test_create_calibre_db() {
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             pubdate TIMESTAMP,
             series_index REAL,
-            last_modified TIMESTAMP,
+            last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             path TEXT NOT NULL,
             has_cover BOOLEAN DEFAULT 0,
-            uuid TEXT NOT NULL
+            uuid TEXT NOT NULL UNIQUE
         )",
         [],
     ).unwrap();
 
     conn.execute(
-        "INSERT INTO books (id, title, sort, author_sort, timestamp, pubdate,
-                           series_index, last_modified, path, has_cover, uuid)
-         VALUES (1, 'Test Book', 'Book, Test', 'Author, Test',
-                 datetime('now'), datetime('now'), 1.0, datetime('now'),
-                 '/test/path', 1, 'test-uuid-123')",
-        []
+        "CREATE TABLE authors (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            sort TEXT,
+            link TEXT
+        )",
+        [],
     ).unwrap();
 
-    // Test CalibreDB
-    let calibre_db = CalibreDB::new(db_path).unwrap();
-    let books = calibre_db.get_all_books().unwrap();
+    conn.execute(
+        "CREATE TABLE books_authors_link (
+            book_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            PRIMARY KEY (book_id, author_id)
+        )",
+        [],
+    ).unwrap();
+
+    // Insert test data
+    conn.execute(
+        "INSERT INTO books (id, title, sort, author_sort, path, uuid)
+         VALUES (1, 'Test Book', 'Book, Test', 'Author, Test', '/test/1', 'uuid-001')",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO authors (id, name, sort) VALUES (1, 'Test Author', 'Author, Test')",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO books_authors_link (book_id, author_id) VALUES (1, 1)",
+        [],
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn test_import_from_calibre() {
+    let temp_dir = TempDir::new().unwrap();
+    let sqlite_path = temp_dir.path().join("metadata.db");
+
+    create_test_calibre_db(&sqlite_path);
+
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://localhost/test".to_string());
+
+    let pool = create_postgres_pool(&database_url, 5).await.unwrap();
+
+    // Clean up
+    sqlx::query("DELETE FROM books WHERE uuid = 'uuid-001'")
+        .execute(&pool)
+        .await
+        .ok();
+
+    let importer = CalibreImporter::new(pool.clone());
+    let stats = importer.import_from_sqlite(&sqlite_path, None).await.unwrap();
+
+    assert_eq!(stats.books_imported, 1);
+
+    // Verify import
+    let books = sqlx::query!("SELECT title, uuid FROM books WHERE uuid = 'uuid-001'")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
     assert_eq!(books.len(), 1);
     assert_eq!(books[0].title, "Test Book");
-    assert_eq!(books[0].path, "/test/path");
-    assert_eq!(books[0].uuid, "test-uuid-123");
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test test_create_calibre_db`
-Expected: COMPILER ERROR - `calibre` module doesn't exist
+Run: `cargo test test_import_from_calibre`
+Expected: COMPILER ERROR - `sync` module doesn't exist
 
-- [ ] **Step 3: Implement CalibreDB**
+- [ ] **Step 3: Add dependencies to Cargo.toml**
+
+```toml
+[dependencies]
+# ... existing dependencies ...
+rusqlite = { version = "0.30", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.23"
+```
+
+- [ ] **Step 4: Create sync module structure**
 
 ```rust
-// src/infrastructure/database/calibre.rs
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::Result as RusqliteResult;
-use std::path::PathBuf;
+// src/infrastructure/sync/mod.rs
+pub mod calibre_import;
+
+pub use calibre_import::CalibreImporter;
+```
+
+```rust
+// src/infrastructure/mod.rs
+pub mod database;
+pub mod auth;
+pub mod cache;
+pub mod sync;
+```
+
+- [ ] **Step 5: Implement Calibre importer**
+
+```rust
+// src/infrastructure/sync/calibre_import.rs
+use rusqlite::{Connection, Result as SqliteResult};
+use sqlx::{PgPool, Executor};
+use std::path::Path;
+use std::collections::HashMap;
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone)]
-pub struct CalibreBook {
-    pub id: i32,
-    pub title: String,
-    pub sort: Option<String>,
-    pub author_sort: Option<String>,
-    pub timestamp: Option<String>,
-    pub pubdate: Option<String>,
-    pub series_index: Option<f32>,
-    pub last_modified: Option<String>,
-    pub path: String,
-    pub has_cover: bool,
-    pub uuid: String,
+pub struct ImportStats {
+    pub books_imported: usize,
+    pub authors_imported: usize,
+    pub tags_imported: usize,
+    pub series_imported: usize,
 }
 
-pub struct CalibreDB {
-    pool: Pool<SqliteConnectionManager>,
+pub struct CalibreImporter {
+    pg_pool: PgPool,
 }
 
-impl CalibreDB {
-    pub fn new(db_path: PathBuf) -> Result<Self, rusqlite::Error> {
-        let manager = SqliteConnectionManager::file(&db_path);
-        let pool = Pool::builder()
-            .max_size(5)
-            .build(manager)
-            .map_err(|e| rusqlite::Error::InvalidPath(db_path.to_string_lossy().to_string()))?;
-
-        Ok(Self { pool })
+impl CalibreImporter {
+    pub fn new(pg_pool: PgPool) -> Self {
+        Self { pg_pool }
     }
 
-    pub fn get_all_books(&self) -> Result<Vec<CalibreBook>, rusqlite::Error> {
-        let conn = self.pool.get()?;
+    pub async fn import_from_sqlite(
+        &self,
+        sqlite_path: &Path,
+        limit_books: Option<usize>,
+    ) -> Result<ImportStats, Box<dyn std::error::Error>> {
+        let conn = Connection::open(sqlite_path)?;
+
+        // Import in transaction
+        let mut tx = self.pg_pool.begin().await?;
+
+        // Import books
+        let mut books_imported = 0;
+        let mut author_map: HashMap<i32, i32> = HashMap::new();
+        let mut tag_map: HashMap<i32, i32> = HashMap::new();
+        let mut series_map: HashMap<i32, i32> = HashMap::new();
+
         let mut stmt = conn.prepare(
             "SELECT id, title, sort, author_sort, timestamp, pubdate,
                     series_index, last_modified, path, has_cover, uuid
-             FROM books"
+             FROM books
+             ORDER BY id"
         )?;
 
-        let books = stmt.query_map([], |row| {
-            Ok(CalibreBook {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                sort: row.get(2)?,
-                author_sort: row.get(3)?,
-                timestamp: row.get(4)?,
-                pubdate: row.get(5)?,
-                series_index: row.get(6)?,
-                last_modified: row.get(7)?,
-                path: row.get(8)?,
-                has_cover: row.get(9)?,
-                uuid: row.get(10)?,
-            })
+        let book_rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i32>(9)?,
+                row.get::<_, String>(10)?,
+            ))
         })?;
 
-        books.collect()
-    }
+        for book_result in book_rows {
+            let (id, title, sort, author_sort, timestamp, pubdate,
+                 series_index, last_modified, path, has_cover, uuid) = book_result?;
 
-    pub fn get_book(&self, id: i32) -> Result<Option<CalibreBook>, rusqlite::Error> {
-        let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, title, sort, author_sort, timestamp, pubdate,
-                    series_index, last_modified, path, has_cover, uuid
-             FROM books WHERE id = ?"
-        )?;
+            // Parse timestamps
+            let ts = timestamp.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let pub = pubdate.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let lm = last_modified.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
 
-        let mut rows = stmt.query([id])?;
+            sqlx::query!(
+                "INSERT INTO books (id, title, sort, author_sort, timestamp, pubdate,
+                                   series_index, last_modified, path, has_cover, uuid)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 ON CONFLICT (id) DO UPDATE
+                 SET title = EXCLUDED.title,
+                     sort = EXCLUDED.sort,
+                     author_sort = EXCLUDED.author_sort,
+                     timestamp = EXCLUDED.timestamp,
+                     pubdate = EXCLUDED.pubdate,
+                     series_index = EXCLUDED.series_index,
+                     last_modified = EXCLUDED.last_modified,
+                     path = EXCLUDED.path,
+                     has_cover = EXCLUDED.has_cover,
+                     updated_at = NOW()",
+                id, title, sort, author_sort, ts, pub, series_index, lm, path, has_cover > 0, uuid
+            )
+            .execute(&mut *tx)
+            .await?;
 
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
+            books_imported += 1;
+
+            if let Some(limit) = limit_books {
+                if books_imported >= limit {
+                    break;
+                }
+            }
         }
+
+        // Import authors
+        let mut authors_imported = 0;
+        let mut stmt = conn.prepare("SELECT id, name, sort, link FROM authors")?;
+        let author_rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+
+        for author_result in author_rows {
+            let (id, name, sort, link) = author_result?;
+            let row = sqlx::query!(
+                "INSERT INTO authors (id, name, sort, link)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (id) DO UPDATE
+                 SET name = EXCLUDED.name, sort = EXCLUDED.sort
+                 RETURNING id",
+                id, name, sort, link
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+
+            author_map.insert(id, row.id);
+            authors_imported += 1;
+        }
+
+        // Import author links
+        let mut stmt = conn.prepare("SELECT book_id, author_id FROM books_authors_link")?;
+        let link_rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?))
+        })?;
+
+        for link_result in link_rows {
+            let (book_id, author_id) = link_result?;
+            if let Some(&pg_author_id) = author_map.get(&author_id) {
+                sqlx::query!(
+                    "INSERT INTO books_authors_link (book_id, author_id)
+                     VALUES ($1, $2)
+                     ON CONFLICT (book_id, author_id) DO NOTHING",
+                    book_id, pg_author_id
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+
+        Ok(ImportStats {
+            books_imported,
+            authors_imported,
+            tags_imported: 0,
+            series_imported: 0,
+        })
     }
 }
 ```
 
-- [ ] **Step 4: Update mod.rs to export calibre**
+- [ ] **Step 6: Create CLI command for import**
 
 ```rust
-// src/infrastructure/database/mod.rs
-pub mod postgres;
-pub mod migrations;
-pub mod calibre;
+// src/main.rs - add import subcommand
+use clap::{Parser, Subcommand};
 
-pub use postgres::{create_postgres_pool, PgPool};
-pub use calibre::CalibreDB;
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Import books from Calibre database
+    Import {
+        /// Path to Calibre metadata.db
+        #[arg(long)]
+        calibre_db: std::path::PathBuf,
+
+        /// Library path for book files
+        #[arg(long)]
+        library_path: std::path::PathBuf,
+
+        /// Dry run without importing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Start web server
+    Serve {
+        /// Address to bind to
+        #[arg(long, default_value = "0.0.0.0:8083")]
+        address: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Import { calibre_db, library_path, dry_run } => {
+            if dry_run {
+                println!("Dry run: Would import from {:?}", calibre_db);
+                return Ok(());
+            }
+
+            let config = calibre_web_rust::config::load_config()?;
+            let pool = calibre_web_rust::infrastructure::database::create_postgres_pool(
+                &config.database.url,
+                config.database.max_connections,
+            ).await?;
+
+            let importer = calibre_web_rust::infrastructure::sync::CalibreImporter::new(pool);
+            let stats = importer.import_from_sqlite(&calibre_db, None).await?;
+
+            println!("Import complete:");
+            println!("  Books: {}", stats.books_imported);
+            println!("  Authors: {}", stats.authors_imported);
+        }
+        Commands::Serve { address } => {
+            // Start web server (to be implemented in later tasks)
+            println!("Starting server on {}", address);
+        }
+    }
+
+    Ok(())
+}
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 7: Run tests to verify they pass**
 
-Run: `cargo test test_create_calibre_db`
-Expected: PASS
+Run: `cargo test test_import_from_calibre`
+Expected: PASS (requires PostgreSQL and test database)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/infrastructure/database/calibre.rs tests/calibre_db_tests.rs
-git commit -m "feat: implement Calibre SQLite database read-only access"
+git add Cargo.toml src/infrastructure/sync/ tests/import_tests.rs src/main.rs
+git commit -m "feat: implement Calibre import tool"
 ```
 
 ---
@@ -1349,6 +1743,10 @@ git commit -m "feat: implement user domain layer with repository"
 
 ## Task 9: Books Domain Layer
 
+**Purpose:** Book repository using PostgreSQL as single source of truth
+
+**Dependencies:** Task 4 (PostgreSQL schema with book tables), Task 5 (Import tool)
+
 **Files:**
 - Create: `src/domain/books/mod.rs`
 - Create: `src/domain/books/repository.rs`
@@ -1358,58 +1756,114 @@ git commit -m "feat: implement user domain layer with repository"
 
 ```rust
 // tests/book_repository_tests.rs
-use calibre_web_rust::domain::books::{Book, BookRepository};
-use calibre_web_rust::infrastructure::database::CalibreDB;
-use tempfile::TempDir;
+use calibre_web_rust::domain::books::{Book, BookRepository, CreateBook, UpdateBook};
+use sqlx::PgPool;
 
-#[test]
-fn test_get_all_books() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("metadata.db");
+async fn create_test_pool() -> PgPool {
+    let db_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://localhost/test".to_string());
 
-    // Create test database
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute(
-        "CREATE TABLE books (
-            id INTEGER PRIMARY KEY,
-            title TEXT NOT NULL,
-            sort TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    ).unwrap();
-
-    conn.execute("INSERT INTO books (id, title) VALUES (1, 'Test Book')", []).unwrap();
-    conn.execute("INSERT INTO books (id, title) VALUES (2, 'Another Book')", []).unwrap();
-
-    let calibre_db = CalibreDB::new(db_path).unwrap();
-    let repo = BookRepository::new(calibre_db);
-
-    let books = repo.get_all_books().unwrap();
-    assert_eq!(books.len(), 2);
-    assert_eq!(books[0].title, "Test Book");
+    sqlx::PgPool::connect(&db_url).await.unwrap()
 }
 
-#[test]
-fn test_get_book_by_id() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("metadata.db");
+#[tokio::test]
+async fn test_get_all_books() {
+    let pool = create_test_pool().await;
 
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute(
-        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
-        [],
-    ).unwrap();
-    conn.execute("INSERT INTO books (id, title) VALUES (1, 'Test Book')", []).unwrap();
+    // Clean up
+    sqlx::query("DELETE FROM books WHERE uuid LIKE 'test-%'")
+        .execute(&pool)
+        .await
+        .ok();
 
-    let calibre_db = CalibreDB::new(db_path).unwrap();
-    let repo = BookRepository::new(calibre_db);
+    let repo = BookRepository::new(pool.clone());
 
-    let book = repo.get_book(1).unwrap();
+    // Create test books
+    let book1 = CreateBook {
+        title: "Test Book 1".to_string(),
+        sort: Some("Book 1, Test".to_string()),
+        author_sort: Some("Author, Test".to_string()),
+        path: "/test/1".to_string(),
+        has_cover: true,
+        uuid: "test-uuid-001".to_string(),
+    };
+
+    let book2 = CreateBook {
+        title: "Test Book 2".to_string(),
+        sort: Some("Book 2, Test".to_string()),
+        author_sort: None,
+        path: "/test/2".to_string(),
+        has_cover: false,
+        uuid: "test-uuid-002".to_string(),
+    };
+
+    repo.create(&book1).await.unwrap();
+    repo.create(&book2).await.unwrap();
+
+    let books = repo.get_all_books().await.unwrap();
+    assert_eq!(books.len(), 2);
+}
+
+#[tokio::test]
+async fn test_get_book_by_id() {
+    let pool = create_test_pool().await;
+    let repo = BookRepository::new(pool.clone());
+
+    let book = repo.get_book(1).await.unwrap();
     assert!(book.is_some());
-    assert_eq!(book.unwrap().title, "Test Book");
+    assert_eq!(book.unwrap().title, "Test Book 1");
 
-    let not_found = repo.get_book(999).unwrap();
+    let not_found = repo.get_book(99999).await.unwrap();
+    assert!(not_found.is_none());
+}
+
+#[tokio::test]
+async fn test_update_book() {
+    let pool = create_test_pool().await;
+    let repo = BookRepository::new(pool.clone());
+
+    // Create book first
+    let create = CreateBook {
+        title: "Original Title".to_string(),
+        sort: None,
+        author_sort: None,
+        path: "/test/update".to_string(),
+        has_cover: false,
+        uuid: "test-update-001".to_string(),
+    };
+    let id = repo.create(&create).await.unwrap();
+
+    // Update it
+    let update = UpdateBook {
+        title: Some("Updated Title".to_string()),
+        sort: Some("Updated, Original".to_string()),
+        author_sort: None,
+    };
+    repo.update_book(id, &update).await.unwrap();
+
+    // Verify
+    let book = repo.get_book(id).await.unwrap().unwrap();
+    assert_eq!(book.title, "Updated Title");
+}
+
+#[tokio::test]
+async fn test_delete_book() {
+    let pool = create_test_pool().await;
+    let repo = BookRepository::new(pool.clone());
+
+    let create = CreateBook {
+        title: "To Delete".to_string(),
+        sort: None,
+        author_sort: None,
+        path: "/test/delete".to_string(),
+        has_cover: false,
+        uuid: "test-delete-001".to_string(),
+    };
+    let id = repo.create(&create).await.unwrap();
+
+    repo.delete_book(id).await.unwrap();
+
+    let not_found = repo.get_book(id).await.unwrap();
     assert!(not_found.is_none());
 }
 ```
@@ -1425,6 +1879,7 @@ Expected: COMPILER ERROR - `books` domain doesn't exist
 // src/domain/books/mod.rs
 pub mod repository;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1433,13 +1888,32 @@ pub struct Book {
     pub title: String,
     pub sort: Option<String>,
     pub author_sort: Option<String>,
-    pub timestamp: Option<String>,
-    pub pubdate: Option<String>,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub pubdate: Option<DateTime<Utc>>,
     pub series_index: Option<f32>,
-    pub last_modified: Option<String>,
+    pub last_modified: DateTime<Utc>,
     pub path: String,
     pub has_cover: bool,
     pub uuid: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateBook {
+    pub title: String,
+    pub sort: Option<String>,
+    pub author_sort: Option<String>,
+    pub path: String,
+    pub has_cover: bool,
+    pub uuid: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBook {
+    pub title: Option<String>,
+    pub sort: Option<String>,
+    pub author_sort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1466,50 +1940,121 @@ impl Default for BookListQuery {
 
 ```rust
 // src/domain/books/repository.rs
-use crate::infrastructure::database::CalibreDB;
-use super::{Book, BookListQuery};
+use sqlx::{PgPool, Row};
+use super::{Book, CreateBook, UpdateBook, BookListQuery};
 
 pub struct BookRepository {
-    calibre_db: CalibreDB,
+    pg_pool: PgPool,
 }
 
 impl BookRepository {
-    pub fn new(calibre_db: CalibreDB) -> Self {
-        Self { calibre_db }
+    pub fn new(pg_pool: PgPool) -> Self {
+        Self { pg_pool }
     }
 
-    pub fn get_all_books(&self) -> Result<Vec<Book>, rusqlite::Error> {
-        self.calibre_db.get_all_books()
-            .map(|books| books.into_iter().map(|b| Book {
-                id: b.id,
-                title: b.title,
-                sort: b.sort,
-                author_sort: b.author_sort,
-                timestamp: b.timestamp,
-                pubdate: b.pubdate,
-                series_index: b.series_index,
-                last_modified: b.last_modified,
-                path: b.path,
-                has_cover: b.has_cover,
-                uuid: b.uuid,
-            }).collect())
+    pub async fn get_all_books(&self) -> Result<Vec<Book>, sqlx::Error> {
+        sqlx::query_as!(
+            Book,
+            "SELECT id, title, sort, author_sort, timestamp, pubdate,
+                    series_index, last_modified, path, has_cover, uuid,
+                    created_at, updated_at
+             FROM books
+             ORDER BY timestamp DESC"
+        )
+        .fetch_all(&self.pg_pool)
+        .await
     }
 
-    pub fn get_book(&self, id: i32) -> Result<Option<Book>, rusqlite::Error> {
-        self.calibre_db.get_book(id)
-            .map(|opt| opt.map(|b| Book {
-                id: b.id,
-                title: b.title,
-                sort: b.sort,
-                author_sort: b.author_sort,
-                timestamp: b.timestamp,
-                pubdate: b.pubdate,
-                series_index: b.series_index,
-                last_modified: b.last_modified,
-                path: b.path,
-                has_cover: b.has_cover,
-                uuid: b.uuid,
-            }))
+    pub async fn get_book(&self, id: i32) -> Result<Option<Book>, sqlx::Error> {
+        sqlx::query_as!(
+            Book,
+            "SELECT id, title, sort, author_sort, timestamp, pubdate,
+                    series_index, last_modified, path, has_cover, uuid,
+                    created_at, updated_at
+             FROM books WHERE id = $1",
+            id
+        )
+        .fetch_optional(&self.pg_pool)
+        .await
+    }
+
+    pub async fn create(&self, book: &CreateBook) -> Result<i32, sqlx::Error> {
+        let row = sqlx::query!(
+            "INSERT INTO books (title, sort, author_sort, path, has_cover, uuid)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id",
+            book.title,
+            book.sort,
+            book.author_sort,
+            book.path,
+            book.has_cover,
+            book.uuid
+        )
+        .fetch_one(&self.pg_pool)
+        .await?;
+
+        Ok(row.id)
+    }
+
+    pub async fn update_book(&self, id: i32, book: &UpdateBook) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE books
+             SET title = COALESCE($2, title),
+                 sort = COALESCE($3, sort),
+                 author_sort = COALESCE($4, author_sort),
+                 last_modified = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1",
+            id,
+            book.title,
+            book.sort,
+            book.author_sort
+        )
+        .execute(&self.pg_pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_book(&self, id: i32) -> Result<(), sqlx::Error> {
+        sqlx::query!("DELETE FROM books WHERE id = $1", id)
+            .execute(&self.pg_pool)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn list_books(&self, query: BookListQuery) -> Result<Vec<Book>, sqlx::Error> {
+        let limit = query.limit.unwrap_or(20);
+        let offset = query.offset.unwrap_or(0);
+        let sort_by = query.sort_by.unwrap_or("timestamp".to_string());
+        let sort_order = query.sort_order.unwrap_or("desc".to_string());
+
+        // Validate sort_by to prevent SQL injection
+        let valid_columns = ["id", "title", "sort", "timestamp", "pubdate", "last_modified"];
+        if !valid_columns.contains(&sort_by.as_str()) {
+            return Err(sqlx::Error::Configuration("Invalid sort column".into()));
+        }
+
+        let order_clause = match sort_order.as_str() {
+            "asc" => "ASC",
+            "desc" => "DESC",
+            _ => return Err(sqlx::Error::Configuration("Invalid sort order".into())),
+        };
+
+        let sql = format!(
+            "SELECT id, title, sort, author_sort, timestamp, pubdate,
+                    series_index, last_modified, path, has_cover, uuid,
+                    created_at, updated_at
+             FROM books
+             ORDER BY {} {}
+             LIMIT {} OFFSET {}",
+            sort_by, order_clause, limit, offset
+        );
+
+        sqlx::query_as::<_, Book>(&sql)
+            .fetch_all(&self.pg_pool)
+            .await
     }
 }
 ```
@@ -1525,13 +2070,13 @@ pub mod books;
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cargo test`
-Expected: PASS
+Expected: PASS (requires PostgreSQL with book schema)
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add src/domain/books/ tests/book_repository_tests.rs
-git commit -m "feat: implement book domain layer with Calibre DB integration"
+git commit -m "feat: implement book domain layer with PostgreSQL CRUD"
 ```
 
 ---
@@ -1901,22 +2446,26 @@ git commit -m "feat: implement authentication routes and web layer"
 
 ## Task 11.5: Session Management
 
+**Purpose:** Encrypted cookie sessions (no database session store)
+
+**Dependencies:** Task 11 (Authentication routes)
+
 **Files:**
 - Modify: `Cargo.toml` (add session dependencies)
 - Create: `src/web/session/mod.rs`
 - Modify: `src/web/routes/auth.rs` (implement login/logout)
-- Modify: `src/web/extractors/auth.rs` (read from session)
+- Create: `src/web/extractors/auth.rs` (read from session)
 - Create: `tests/session_tests.rs`
 
-**CRITICAL:** This task implements encrypted cookie sessions as specified in the SDD (lines 936-958). Without this, authentication cannot work.
+**Note:** Per design spec, sessions use encrypted cookies with no Redis/database backend.
 
 - [ ] **Step 1: Add session dependencies to Cargo.toml**
 
 Add to `[dependencies]`:
 ```toml
-# Sessions (already added in Task 1)
+# Encrypted cookie sessions
 tower-sessions = "0.11"
-tower-sessions-sqlx-store = "0.11"  # For PostgreSQL session store
+tower-sessions-core = "0.11"
 ```
 
 - [ ] **Step 2: Write failing test for session management**
@@ -1950,12 +2499,76 @@ async fn test_login_creates_session() {
     // Should redirect after successful login
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-    // Check for session cookie
+    // Check for session cookie (encrypted, not just a token)
     let set_cookie = response
         .headers()
         .get("set-cookie")
         .expect("Session cookie should be set");
-    assert!(set_cookie.to_str().unwrap().contains("session"));
+    let cookie_str = set_cookie.to_str().unwrap();
+    assert!(cookie_str.contains("session"));
+    // Encrypted cookies are long (>50 chars)
+    assert!(cookie_str.len() > 50);
+}
+
+#[tokio::test]
+async fn test_logout_clears_session() {
+    let app = calibre_web_rust::web::create_app().await;
+
+    // Login first
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/login")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(Body::from("username=admin&password=admin123"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Extract session cookie
+    let set_cookie = login_response
+        .headers()
+        .get("set-cookie")
+        .unwrap();
+    let session_cookie = set_cookie.to_str().unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+
+    // Logout
+    let logout_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/logout")
+                .header("Cookie", session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(logout_response.status(), StatusCode::SEE_OTHER);
+
+    // Try to access protected route (should fail)
+    let protected_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/admin")
+                .header("Cookie", session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(protected_response.status(), StatusCode::UNAUTHORIZED);
 }
 ```
 
@@ -1964,21 +2577,20 @@ async fn test_login_creates_session() {
 Run: `cargo test test_login_creates_session`
 Expected: FAIL - sessions not implemented
 
-- [ ] **Step 4: Implement session module**
+- [ ] **Step 4: Implement session module with encrypted cookies**
 
 ```rust
 // src/web/session/mod.rs
 use axum::{
-    extract::{State, FromRequestParts},
+    extract::FromRequestParts,
     http::request::Parts,
     async_trait,
 };
-use calibre_web_rust::domain::users::{User, RoleFlags};
+use calibre_web_rust::domain::users::RoleFlags;
 use serde::{Deserialize, Serialize};
 use tower_sessions::{Session, SessionManager};
-use tower_sessions_sqlx_store::PostgresStore;
-use std::sync::Arc;
 
+/// Session data stored in encrypted cookie
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
     pub user_id: i32,
@@ -1987,11 +2599,22 @@ pub struct SessionData {
     pub csrf_token: String,
 }
 
-pub async fn create_session_manager(pool: &sqlx::PgPool) -> SessionManager<PostgresStore<sqlx::PgPool>> {
-    let session_store = PostgresStore::new(pool.clone());
-    SessionManager::new(session_store)
+/// Create session manager with encrypted cookie storage
+///
+/// Uses AES-256-GCM encryption with keys rotated automatically.
+/// No database storage required - all data in encrypted cookie.
+pub fn create_session_manager(secret: &[u8]) -> SessionManager {
+    SessionManager::new(tower_sessions::cookie::CookieStore::new())
+        .with_secure(true)
+        .with_http_only(true)
+        .with_same_site(tower_sessions::cookie::SameSite::Lax)
+        .with_secret(secret)
 }
 
+/// Authenticated user extractor
+///
+/// Automatically extracts user from encrypted session cookie.
+/// Returns Unauthorized error if session is invalid or missing.
 pub struct AuthenticatedUser {
     pub user_id: i32,
     pub username: String,
@@ -2025,7 +2648,78 @@ where
 }
 ```
 
-- [ ] **Step 5: Update auth routes to use sessions**
+- [ ] **Step 5: Create auth extractor module**
+
+```rust
+// src/web/extractors/auth.rs
+use axum::{
+    extract::FromRequestParts,
+    http::request::Parts,
+    async_trait,
+};
+use calibre_web_rust::domain::users::RoleFlags;
+use calibre_web_rust::error::AppError;
+
+/// Extractor for admin-only routes
+///
+/// Verifies user is authenticated AND has ADMIN role.
+pub struct AdminUser {
+    pub user_id: i32,
+    pub username: String,
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for AdminUser
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let user = crate::web::session::AuthenticatedUser::from_request_parts(parts, state)
+            .await?;
+
+        if !user.roles.contains(RoleFlags::ADMIN) {
+            return Err(AppError::Auth(
+                calibre_web_rust::error::AuthError::Forbidden
+            ));
+        }
+
+        Ok(AdminUser {
+            user_id: user.user_id,
+            username: user.username,
+        })
+    }
+}
+
+/// Optional auth extractor
+///
+/// Returns None if not authenticated, doesn't error.
+pub struct OptionalAuth(pub Option<crate::web::session::AuthenticatedUser>);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for OptionalAuth
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match crate::web::session::AuthenticatedUser::from_request_parts(parts, state).await {
+            Ok(user) => Ok(OptionalAuth(Some(user))),
+            Err(_) => Ok(OptionalAuth(None)),
+        }
+    }
+}
+```
+
+- [ ] **Step 6: Update auth routes to use encrypted cookie sessions**
 
 ```rust
 // src/web/routes/auth.rs - update login function
@@ -2035,7 +2729,9 @@ use axum::{
 };
 use tower_sessions::Session;
 use crate::domain::users::{UserRepository, RoleFlags};
-use crate::infrastructure::auth::{hash_password, verify_password};
+use crate::infrastructure::auth::verify_password;
+use crate::web::session::SessionData;
+use crate::error::{AppError, AuthError};
 
 async fn login(
     session: Session,
@@ -2055,7 +2751,7 @@ async fn login(
         return Err(AppError::Auth(AuthError::InvalidCredentials));
     }
 
-    // Create session data
+    // Create session data (stored in encrypted cookie)
     let session_data = SessionData {
         user_id: user.id,
         username: user.username.clone(),
@@ -2063,34 +2759,44 @@ async fn login(
         csrf_token: uuid::Uuid::new_v4().to_string(),
     };
 
-    // Store in session
+    // Store in encrypted session cookie
     session.insert("user", session_data).await?;
 
-    // Update last login
+    // Update last login in database
     let _ = user_repo.update_last_login(user.id).await;
 
     Ok(Redirect::to("/"))
 }
 
 async fn logout(session: Session) -> AppResult<impl IntoResponse> {
+    // Clear encrypted session cookie
     session.flush().await?;
     Ok(Redirect::to("/login"))
 }
 ```
 
-- [ ] **Step 6: Update web layer to use sessions**
+- [ ] **Step 7: Update web layer to use encrypted cookie sessions**
 
 ```rust
 // src/web/mod.rs - update create_app
 use sqlx::PgPool;
 use std::sync::Arc;
 use crate::web::session::create_session_manager;
+use crate::config::AppConfig;
 
-pub async fn create_app() -> Router {
-    // TODO: Get pool from config/state
-    let pool = PgPool::connect("postgresql://localhost/test").await.unwrap();
+pub async fn create_app(config: &AppConfig) -> Router {
+    let pool = sqlx::PgPool::connect(&config.database.url)
+        .await
+        .expect("Failed to connect to database");
 
-    let session_manager = create_session_manager(&pool).await;
+    // Run migrations
+    crate::infrastructure::database::ensure_migrations_run(&pool)
+        .await
+        .expect("Failed to run migrations");
+
+    // Create session manager with encrypted cookies
+    let session_manager = create_session_manager(config.session.secret.as_bytes());
+
     let user_repo = Arc::new(UserRepository::new(pool.clone()));
 
     Router::new()
@@ -2100,15 +2806,15 @@ pub async fn create_app() -> Router {
 }
 ```
 
-- [ ] **Step 7: Run tests to verify they pass**
+- [ ] **Step 8: Run tests to verify they pass**
 
 Run: `cargo test test_login_creates_session`
 Expected: PASS
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add Cargo.toml src/web/session/ src/web/routes/auth.rs src/web/mod.rs tests/session_tests.rs
+git add Cargo.toml src/web/session/ src/web/extractors/ src/web/routes/auth.rs src/web/mod.rs tests/session_tests.rs
 git commit -m "feat: implement encrypted cookie session management"
 ```
 
@@ -2325,6 +3031,721 @@ Expected: PASS
 ```bash
 git add src/web/routes/books.rs templates/books/ tests/integration/books_tests.rs
 git commit -m "feat: implement books listing, detail, and search routes"
+```
+
+---
+
+## Task 11.9: Export Tool (PostgreSQL → Calibre)
+
+**Purpose:** Export books from PostgreSQL to Calibre-compatible SQLite format
+
+**Dependencies:** Task 5 (Import tool), Task 9 (Books repository)
+
+**Files:**
+- Create: `src/infrastructure/sync/calibre_export.rs`
+- Create: `tests/export_tests.rs`
+- Modify: `src/main.rs` (add export CLI command)
+
+- [ ] **Step 1: Write failing test for export**
+
+```rust
+// tests/export_tests.rs
+use calibre_web_rust::infrastructure::sync::calibre_export::{CalibreExporter, ExportStats};
+use calibre_web_rust::infrastructure::database::create_postgres_pool;
+use tempfile::TempDir;
+
+#[tokio::test]
+async fn test_export_to_sqlite() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://localhost/test".to_string());
+
+    let pool = create_postgres_pool(&database_url, 5).await.unwrap();
+
+    let temp_dir = TempDir::new().unwrap();
+    let output_path = temp_dir.path().join("exported.db");
+
+    let exporter = CalibreExporter::new(pool.clone());
+    let stats = exporter.export_to_sqlite(&output_path, false).await.unwrap();
+
+    assert!(stats.books_exported > 0);
+
+    // Verify SQLite file was created
+    assert!(output_path.exists());
+
+    // Verify schema
+    let conn = rusqlite::Connection::open(&output_path).unwrap();
+    let table_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='books'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(table_count, 1);
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test test_export_to_sqlite`
+Expected: COMPILER ERROR - `calibre_export` module doesn't exist
+
+- [ ] **Step 3: Implement Calibre exporter**
+
+```rust
+// src/infrastructure/sync/calibre_export.rs
+use rusqlite::{Connection, Result as SqliteResult};
+use sqlx::{PgPool, Row};
+use std::path::Path;
+
+#[derive(Debug, Clone)]
+pub struct ExportStats {
+    pub books_exported: usize,
+    pub authors_exported: usize,
+    pub tags_exported: usize,
+}
+
+pub struct CalibreExporter {
+    pg_pool: PgPool,
+}
+
+impl CalibreExporter {
+    pub fn new(pg_pool: PgPool) -> Self {
+        Self { pg_pool }
+    }
+
+    pub async fn export_to_sqlite(
+        &self,
+        sqlite_path: &Path,
+        include_files: bool,
+    ) -> Result<ExportStats, Box<dyn std::error::Error>> {
+        // Create new SQLite database
+        let conn = Connection::open(sqlite_path)?;
+
+        // Create Calibre-compatible schema
+        self.create_calibre_schema(&conn)?;
+
+        // Export books
+        let books = self.export_books(&conn).await?;
+        let book_count = books.len();
+
+        // Export relations (authors, tags, series, etc.)
+        let authors_count = self.export_relations(&conn).await?;
+
+        // Copy files if requested
+        if include_files {
+            self.copy_book_files(&conn).await?;
+        }
+
+        Ok(ExportStats {
+            books_exported: book_count,
+            authors_exported: authors_count,
+            tags_exported: 0,
+        })
+    }
+
+    fn create_calibre_schema(&self, conn: &Connection) -> SqliteResult<()> {
+        // Books table
+        conn.execute(
+            "CREATE TABLE books (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                sort TEXT,
+                author_sort TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                pubdate TIMESTAMP,
+                series_index REAL,
+                last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                path TEXT NOT NULL,
+                has_cover BOOLEAN DEFAULT 0,
+                uuid TEXT NOT NULL UNIQUE
+            )",
+            [],
+        )?;
+
+        // Authors table
+        conn.execute(
+            "CREATE TABLE authors (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                sort TEXT,
+                link TEXT
+            )",
+            [],
+        )?;
+
+        // Link tables
+        conn.execute(
+            "CREATE TABLE books_authors_link (
+                book_id INTEGER NOT NULL,
+                author_id INTEGER NOT NULL,
+                PRIMARY KEY (book_id, author_id)
+            )",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    async fn export_books(&self, conn: &Connection) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        let rows = sqlx::query!("SELECT id, title, sort, author_sort, timestamp, pubdate,
+                                        series_index, last_modified, path, has_cover, uuid
+                                 FROM books")
+            .fetch_all(&self.pg_pool)
+            .await?;
+
+        let mut book_ids = Vec::new();
+
+        for row in rows {
+            conn.execute(
+                "INSERT INTO books (id, title, sort, author_sort, timestamp, pubdate,
+                                   series_index, last_modified, path, has_cover, uuid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                [
+                    &row.id.to_string(),
+                    &row.title,
+                    &row.sort.unwrap_or_default(),
+                    &row.author_sort.unwrap_or_default(),
+                    &row.timestamp.map(|d| d.to_rfc3339()).unwrap_or_default(),
+                    &row.pubdate.map(|d| d.to_rfc3339()).unwrap_or_default(),
+                    &row.series_index.map(|f| f.to_string()).unwrap_or_default(),
+                    &row.last_modified.to_rfc3339(),
+                    &row.path,
+                    &(if row.has_cover { "1" } else { "0" }).to_string(),
+                    &row.uuid,
+                ],
+            )?;
+
+            book_ids.push(row.id);
+        }
+
+        Ok(book_ids)
+    }
+
+    async fn export_relations(&self, conn: &Connection) -> Result<usize, Box<dyn std::error::Error>> {
+        // Export authors
+        let authors = sqlx::query!("SELECT id, name, sort, link FROM authors")
+            .fetch_all(&self.pg_pool)
+            .await?;
+
+        for author in &authors {
+            conn.execute(
+                "INSERT INTO authors (id, name, sort, link) VALUES (?1, ?2, ?3, ?4)",
+                [
+                    &author.id.to_string(),
+                    &author.name,
+                    &author.sort.as_deref().unwrap_or(""),
+                    &author.link.as_deref().unwrap_or(""),
+                ],
+            )?;
+        }
+
+        // Export book-author links
+        let links = sqlx::query!("SELECT book_id, author_id FROM books_authors_link")
+            .fetch_all(&self.pg_pool)
+            .await?;
+
+        for link in &links {
+            conn.execute(
+                "INSERT INTO books_authors_link (book_id, author_id) VALUES (?1, ?2)",
+                [&link.book_id.to_string(), &link.author_id.to_string()],
+            )?;
+        }
+
+        Ok(authors.len())
+    }
+
+    async fn copy_book_files(&self, _conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+        // TODO: Implement file copying from library path to Calibre structure
+        // This requires knowledge of the Calibre library directory structure
+        Ok(())
+    }
+}
+```
+
+- [ ] **Step 4: Update sync module**
+
+```rust
+// src/infrastructure/sync/mod.rs
+pub mod calibre_import;
+pub mod calibre_export;
+
+pub use calibre_import::CalibreImporter;
+pub use calibre_export::CalibreExporter;
+```
+
+- [ ] **Step 5: Add export CLI command**
+
+```rust
+// src/main.rs - add to Commands enum
+#[derive(Subcommand)]
+enum Commands {
+    /// Import books from Calibre database
+    Import {
+        /// Path to Calibre metadata.db
+        #[arg(long)]
+        calibre_db: std::path::PathBuf,
+
+        /// Library path for book files
+        #[arg(long)]
+        library_path: std::path::PathBuf,
+
+        /// Dry run without importing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Export books to Calibre database
+    Export {
+        /// Output path for Calibre metadata.db
+        #[arg(long)]
+        output: std::path::PathBuf,
+
+        /// Library path for book files
+        #[arg(long)]
+        library_path: std::path::PathBuf,
+
+        /// Include book files in export
+        #[arg(long)]
+        include_files: bool,
+    },
+    /// Start web server
+    Serve {
+        /// Address to bind to
+        #[arg(long, default_value = "0.0.0.0:8083")]
+        address: String,
+    },
+}
+
+// Update match in main()
+match cli.command {
+    Commands::Import { calibre_db, library_path, dry_run } => {
+        // ... existing import code
+    }
+    Commands::Export { output, library_path, include_files } => {
+        let config = calibre_web_rust::config::load_config()?;
+        let pool = calibre_web_rust::infrastructure::database::create_postgres_pool(
+            &config.database.url,
+            config.database.max_connections,
+        ).await?;
+
+        let exporter = calibre_web_rust::infrastructure::sync::CalibreExporter::new(pool);
+        let stats = exporter.export_to_sqlite(&output, include_files).await?;
+
+        println!("Export complete:");
+        println!("  Books: {}", stats.books_exported);
+        println!("  Authors: {}", stats.authors_exported);
+        println!("  Output: {:?}", output);
+    }
+    Commands::Serve { address } => {
+        println!("Starting server on {}", address);
+    }
+}
+```
+
+- [ ] **Step 6: Run tests to verify they pass**
+
+Run: `cargo test test_export_to_sqlite`
+Expected: PASS
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/infrastructure/sync/calibre_export.rs tests/export_tests.rs src/main.rs
+git commit -m "feat: implement Calibre export tool"
+```
+
+---
+
+## Task 11.10: Bidirectional Sync
+
+**Purpose:** Keep PostgreSQL and Calibre SQLite synchronized
+
+**Dependencies:** Task 5 (Import), Task 11.9 (Export), Task 11.5 (Sessions)
+
+**Files:**
+- Create: `src/infrastructure/sync/bidirectional_sync.rs`
+- Create: `src/domain/sync/mod.rs`
+- Modify: `config/default.toml` (add sync configuration)
+- Create: `tests/sync_tests.rs`
+- Create: `src/web/routes/sync.rs` (sync API endpoints)
+
+- [ ] **Step 1: Add sync configuration**
+
+```toml
+# config/default.toml
+
+[sync]
+enabled = true
+auto_sync = true
+interval_minutes = 5
+conflict_resolution = "last_write_wins"  # or "postgresql_wins", "manual"
+calibre_sqlite_path = "/var/lib/calibre-web/library/metadata.db"
+```
+
+- [ ] **Step 2: Write failing test for bidirectional sync**
+
+```rust
+// tests/sync_tests.rs
+use calibre_web_rust::infrastructure::sync::bidirectional_sync::{
+    BidirectionalSync, SyncConfig, SyncReport
+};
+use calibre_web_rust::infrastructure::database::create_postgres_pool;
+use calibre_web_rust::domain::sync::ChangeType;
+use tempfile::TempDir;
+
+async fn setup_sync_test() -> (sqlx::PgPool, tempfile::TempDir, CalibreExporter) {
+    let pool = create_postgres_pool(
+        &std::env::var("TEST_DATABASE_URL").unwrap_or("postgresql://localhost/test".to_string()),
+        5
+    ).await.unwrap();
+
+    let temp_dir = TempDir::new().unwrap();
+    let sqlite_path = temp_dir.path().join("metadata.db");
+
+    // Create test Calibre database
+    create_test_calibre_db(&sqlite_path);
+
+    // Import to PostgreSQL
+    let importer = CalibreImporter::new(pool.clone());
+    importer.import_from_sqlite(&sqlite_path, None).await.unwrap();
+
+    (pool, temp_dir, CalibreExporter::new(pool))
+}
+
+#[tokio::test]
+async fn test_bidirectional_sync() {
+    let (pool, temp_dir, _) = setup_sync_test().await;
+    let sqlite_path = temp_dir.path().join("metadata.db");
+
+    // Modify PostgreSQL
+    sqlx::query!("UPDATE books SET title = 'PG Title' WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SyncConfig {
+        conflict_resolution: ConflictResolution::PostgresWins,
+        ..Default::default()
+    };
+
+    let sync = BidirectionalSync::new(pool.clone(), config);
+    let report = sync.sync_bidirectional(&sqlite_path).await.unwrap();
+
+    assert_eq!(report.pg_updated, 0);
+    assert_eq!(report.sqlite_updated, 1);
+}
+
+#[tokio::test]
+async fn test_conflict_detection() {
+    let (pool, temp_dir, _) = setup_sync_test().await;
+    let sqlite_path = temp_dir.path().join("metadata.db");
+
+    // Modify both databases
+    sqlx::query!("UPDATE books SET title = 'PG Title', last_modified = NOW() WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Modify SQLite directly
+    let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+    conn.execute(
+        "UPDATE books SET title = 'SQLite Title', last_modified = datetime('now') WHERE id = 1",
+        [],
+    ).unwrap();
+
+    let config = SyncConfig {
+        conflict_resolution: ConflictResolution::Manual,
+        ..Default::default()
+    };
+
+    let sync = BidirectionalSync::new(pool.clone(), config);
+    let report = sync.sync_bidirectional(&sqlite_path).await.unwrap();
+
+    assert!(report.conflicts > 0);
+}
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `cargo test test_bidirectional_sync`
+Expected: COMPILER ERROR - sync modules don't exist
+
+- [ ] **Step 4: Implement sync domain logic**
+
+```rust
+// src/domain/sync/mod.rs
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeType {
+    Added,
+    Modified,
+    Deleted,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictResolution {
+    LastWriteWins,
+    PostgresWins,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRecord {
+    pub table_name: String,
+    pub record_id: i32,
+    pub change_type: ChangeType,
+    pub last_modified: chrono::DateTime<chrono::Utc>,
+    pub checksum: String,
+}
+```
+
+- [ ] **Step 5: Implement bidirectional sync**
+
+```rust
+// src/infrastructure/sync/bidirectional_sync.rs
+use sqlx::{PgPool, Row};
+use rusqlite::Connection;
+use std::path::Path;
+use crate::domain::sync::{ChangeType, ConflictResolution};
+
+#[derive(Debug, Clone)]
+pub struct SyncConfig {
+    pub enabled: bool,
+    pub auto_sync: bool,
+    pub interval_minutes: u64,
+    pub conflict_resolution: ConflictResolution,
+    pub calibre_sqlite_path: String,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_sync: false,
+            interval_minutes: 5,
+            conflict_resolution: ConflictResolution::LastWriteWins,
+            calibre_sqlite_path: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncReport {
+    pub pg_updated: usize,
+    pub sqlite_updated: usize,
+    pub conflicts: usize,
+    pub errors: Vec<String>,
+}
+
+pub struct BidirectionalSync {
+    pg_pool: PgPool,
+    config: SyncConfig,
+}
+
+impl BidirectionalSync {
+    pub fn new(pg_pool: PgPool, config: SyncConfig) -> Self {
+        Self { pg_pool, config }
+    }
+
+    pub async fn sync_bidirectional(&self, sqlite_path: &Path) -> Result<SyncReport, Box<dyn std::error::Error>> {
+        let mut report = SyncReport {
+            pg_updated: 0,
+            sqlite_updated: 0,
+            conflicts: 0,
+            errors: Vec::new(),
+        };
+
+        // Detect changes in both databases
+        let pg_changes = self.detect_postgres_changes().await?;
+        let sqlite_changes = self.detect_sqlite_changes(sqlite_path)?;
+
+        // Classify and sync changes
+        for pg_change in &pg_changes {
+            match self.resolve_change(pg_change, &sqlite_changes, sqlite_path).await? {
+                SyncAction::UpdatePg => report.pg_updated += 1,
+                SyncAction::UpdateSqlite => report.sqlite_updated += 1,
+                SyncAction::Conflict => report.conflicts += 1,
+                SyncAction::None => {}
+            }
+        }
+
+        Ok(report)
+    }
+
+    async fn detect_postgres_changes(&self) -> Result<Vec<SyncRecord>, Box<dyn std::error::Error>> {
+        let rows = sqlx::query!(
+            "SELECT id, title, last_modified FROM books WHERE last_modified > (
+                SELECT COALESCE(last_sync_at, '1970-01-01'::timestamp) FROM sync_state LIMIT 1
+            )"
+        )
+        .fetch_all(&self.pg_pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| Ok(SyncRecord {
+                table_name: "books".to_string(),
+                record_id: row.id,
+                change_type: ChangeType::Modified,
+                last_modified: row.last_modified,
+                checksum: format!("{}:{}", row.id, row.title),
+            }))
+            .collect()
+    }
+
+    fn detect_sqlite_changes(&self, sqlite_path: &Path) -> Result<Vec<SyncRecord>, Box<dyn std::error::Error>> {
+        let conn = Connection::open(sqlite_path)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, title, last_modified FROM books WHERE last_modified > ?
+             ORDER BY last_modified DESC"
+        )?;
+
+        // TODO: Get last sync time from sync_state
+        let last_sync = "1970-01-01";
+
+        let rows = stmt.query_map([last_sync], |row| {
+            Ok(SyncRecord {
+                table_name: "books".to_string(),
+                record_id: row.get(0)?,
+                change_type: ChangeType::Modified,
+                last_modified: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(1)?)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                checksum: format!("{}:{}", row.get::<_, i32>(0)?, row.get::<_, String>(2)?),
+            })
+        })?;
+
+        rows.collect()
+    }
+
+    async fn resolve_change(
+        &self,
+        pg_change: &SyncRecord,
+        sqlite_changes: &[SyncRecord],
+        _sqlite_path: &Path,
+    ) -> Result<SyncAction, Box<dyn std::error::Error>> {
+        // Find matching SQLite record
+        let sqlite_match = sqlite_changes.iter()
+            .find(|s| s.record_id == pg_change.record_id);
+
+        match (sqlite_match, self.config.conflict_resolution) {
+            (None, _) => Ok(SyncAction::UpdateSqlite),
+            (Some(sqlite_change), ConflictResolution::PostgresWins) => {
+                if pg_change.last_modified > sqlite_change.last_modified {
+                    Ok(SyncAction::UpdateSqlite)
+                } else {
+                    Ok(SyncAction::None)
+                }
+            }
+            (Some(_), ConflictResolution::LastWriteWins) => {
+                if pg_change.last_modified > sqlite_match.unwrap().last_modified {
+                    Ok(SyncAction::UpdateSqlite)
+                } else {
+                    Ok(SyncAction::UpdatePg)
+                }
+            }
+            (Some(_), ConflictResolution::Manual) => Ok(SyncAction::Conflict),
+        }
+    }
+}
+
+enum SyncAction {
+    UpdatePg,
+    UpdateSqlite,
+    Conflict,
+    None,
+}
+```
+
+- [ ] **Step 6: Create sync API routes**
+
+```rust
+// src/web/routes/sync.rs
+use axum::{
+    extract::{Path, State},
+    response::{IntoResponse, Json},
+};
+use serde::Deserialize;
+use std::sync::Arc;
+
+#[derive(Deserialize)]
+pub struct TriggerSyncParams {
+    force: Option<bool>,
+}
+
+async fn trigger_sync(
+    State(pool): State<Arc<sqlx::PgPool>>,
+    Json(params): Json<TriggerSyncParams>,
+) -> AppResult<impl IntoResponse> {
+    let config = SyncConfig::default();
+    let sync = BidirectionalSync::new(pool.as_ref().clone(), config);
+
+    let report = sync.sync_bidirectional(Path::new(&config.calibre_sqlite_path)).await?;
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "pg_updated": report.pg_updated,
+        "sqlite_updated": report.sqlite_updated,
+        "conflicts": report.conflicts,
+    })))
+}
+
+async fn sync_status(
+    State(pool): State<Arc<sqlx::PgPool>>,
+) -> AppResult<impl IntoResponse> {
+    let row = sqlx::query!(
+        "SELECT last_sync_at, sync_status FROM sync_state ORDER BY id DESC LIMIT 1"
+    )
+    .fetch_optional(pool.as_ref())
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "last_sync": row.and_then(|r| r.last_sync_at),
+        "status": row.map(|r| r.sync_status).unwrap_or("idle".to_string()),
+    })))
+}
+
+async fn sync_report(
+    Path(sync_id): Path<i64>,
+    State(pool): State<Arc<sqlx::PgPool>>,
+) -> AppResult<impl IntoResponse> {
+    let row = sqlx::query!(
+        "SELECT * FROM sync_state WHERE id = $1",
+        sync_id
+    )
+    .fetch_optional(pool.as_ref())
+    .await?;
+
+    match row {
+        Some(state) => Ok(Json(state)),
+        None => Err(AppError::NotFound("Sync report not found".to_string())),
+    }
+}
+```
+
+- [ ] **Step 7: Update sync module**
+
+```rust
+// src/infrastructure/sync/mod.rs
+pub mod calibre_import;
+pub mod calibre_export;
+pub mod bidirectional_sync;
+
+pub use calibre_import::CalibreImporter;
+pub use calibre_export::CalibreExporter;
+pub use bidirectional_sync::{BidirectionalSync, SyncConfig, SyncReport};
+```
+
+- [ ] **Step 8: Run tests to verify they pass**
+
+Run: `cargo test test_bidirectional_sync`
+Expected: PASS
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/infrastructure/sync/bidirectional_sync.rs src/domain/sync/ config/default.toml tests/sync_tests.rs src/web/routes/sync.rs
+git commit -m "feat: implement bidirectional sync between PostgreSQL and Calibre"
 ```
 
 ---
