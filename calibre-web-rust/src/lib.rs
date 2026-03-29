@@ -2,9 +2,6 @@
 
 pub mod config;
 pub mod error;
+pub mod infrastructure;
 
 pub use error::{AppError, AppResult};
-
-pub mod infrastructure;
-pub mod domain;
-pub mod web;
